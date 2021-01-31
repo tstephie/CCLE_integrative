@@ -42,5 +42,7 @@ Folders in github that are relevant:
       - R code (use the most current one: v3.1)
   5) metadata
       - extra metadata sets
+  6) presentations
+      - presentations on methods and results
 
 
