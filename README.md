@@ -44,5 +44,7 @@ Folders in github that are relevant:
       - extra metadata sets
   6) presentations
       - presentations on methods and results
+  7) lm_FC
+      - plots for linear model transformation
 
 
