@@ -1,0 +1,908 @@
+---
+title: "CCLE_integrative_pathway_analysis_v3.1"
+date: "7/31/2020"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, message = F}
+# Load in packages
+library(tidyverse)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(msigdbr)
+library(ggplot2)
+library(ggfortify)
+library(gPCA)
+library(plotly)
+library(DESeq2)
+library(limma)
+
+# Set directory
+setwd("~/tutorial_r/integrative/CCLE")
+```
+
+# RNA-seq normalization and DE analysis (DESeq2)
+```{r}
+# Load in raw counts for RNA-seq
+rnaseq_data <- read.delim2(file = 'CCLE_RNAseq_genes_counts_20180929.gct', sep = '\t', skip = 2, header = T,stringsAsFactors = F)
+rnaseq_names <- rnaseq_data[,1:2]
+
+# Load in metadata on breast cancer cell lines (positive or negative)
+line_metadata <- read.csv('breast_cell_lines_V2.csv', header = T, stringsAsFactors = F, row.names = 1)
+line_metadata$ERsign <- as.factor(line_metadata$ERsign)
+
+# Get only breast cancer cell lines 
+rnaseq_data <- rnaseq_data[,match(rownames(line_metadata), colnames(rnaseq_data))]
+rownames(rnaseq_data) <- rnaseq_names$Name
+all(rownames(line_metadata) == colnames(rnaseq_data)) # Check if got the right cell lines
+
+# Create DESeq dataset 
+rnaseq_DE <- DESeqDataSetFromMatrix(countData = rnaseq_data,
+                                    colData = line_metadata,
+                                    design = ~ERsign)
+
+# Relevel so that negative cell lines are the reference
+rnaseq_DE$ERsign <- relevel(rnaseq_DE$ERsign, ref = "neg")
+
+# Run DE
+rnaseq_DE <- DESeq(rnaseq_DE)
+res <- results(rnaseq_DE, contrast = c("ERsign", "pos", "neg"), pAdjustMethod="fdr")
+summary(res)
+
+# Get data.frame of DE genes
+res_data <- as.data.frame(res)
+res_data <- res_data[which(res_data$padj < .05),]
+
+# add gene names column
+res_data$gene_name <- rnaseq_names$Description[match(rownames(res_data), rnaseq_names$Name)] 
+
+```
+
+# Batch Effect Analysis
+## RNA-seq (DESeq2)
+```{r}
+# Get normalized counts from DESeq2 object
+rnaseq_data_normalized <- log2(t(counts(rnaseq_DE, normalized = T)) + 1)
+
+# Find genes with 0 variance and filter them out
+rnaseq_norm_var <- apply(rnaseq_data_normalized, 2, var)
+var_0 <- which(rnaseq_norm_var == 0)
+rnaseq_data_normalized_filt <- rnaseq_data_normalized[,-var_0]
+
+# Run PCA
+rnaseq_norm_pca <- prcomp(rnaseq_data_normalized_filt, scale. = T, center = T)
+
+# calculate variance explained by first two pcs
+rnaseq_norm_pca_percent <- round(100*rnaseq_norm_pca$sdev^2/sum(rnaseq_norm_pca$sdev^2), 1)
+pca_data_rna <- data.frame(PC1 = rnaseq_norm_pca$x[,1], PC2 = rnaseq_norm_pca$x[,2],
+                       sample = rownames(line_metadata), condition = line_metadata$ERsign)
+
+# plot pca and find samples samples that don't separate groups
+pca_plot_rna <- pca_data_rna %>% ggplot(aes(PC1, PC2, color = condition, group = sample)) + geom_point(size = 5) + labs(x=paste0("PC1 (",rnaseq_norm_pca_percent[1], "%)"), y=paste0("PC2 (",rnaseq_norm_pca_percent[2],"%)")) + theme_classic()
+ggplotly(pca_plot_rna, tooltip = "sample")
+
+# samples that can drop:
+## found this from plot
+out_pos_samples_rna <- c('BT20_BREAST', 'JIMT1_BREAST', 'HCC1937_BREAST', 'HMC18_BREAST', 'MDAMB231_BREAST', 'MDAMB436_BREAST', 'CAL120_BREAST', 'HDQP1_BREAST', 'HCC1187_BREAST', 'HCC1143_BREAST', 'HS578T_BREAST', 'HCC1599_BREAST')
+out_neg_samples_rna <- c('HCC202_BREAST')
+
+# Check if samples are in data
+out_pos_samples_rna %in% rownames(pca_data_rna)
+
+```
+
+## RPPA
+```{r}
+# Load in data
+rppa_data <- read.csv(file = 'CCLE_RPPA_20181003.csv', header = T, stringsAsFactors = F, check.names = F)
+rownames(rppa_data) <- rppa_data[,1]
+rppa_data[,1] <- NULL
+
+# Get only breast cancer cell lines 
+rppa_data <- rppa_data[match(rownames(line_metadata), rownames(rppa_data)),]
+all(rownames(line_metadata) == rownames(rppa_data)) # Check if got the right cell lines
+
+# Find genes with 0 variance and filter them outs
+rppa_var <- apply(rppa_data, 2, var)
+var_0 <- which(rppa_var == 0) # no zero variance
+
+# run PCA
+rppa_pca <- prcomp(rppa_data, scale. = T, center = T)
+
+# calculate variance explained by first two pcs
+rppa_pca_percent <- round(100*rppa_pca$sdev^2/sum(rppa_pca$sdev^2), 1)
+pca_data_rppa <- data.frame(PC1 = rppa_pca$x[,1], PC2 = rppa_pca$x[,2],
+                       sample = rownames(line_metadata), condition = line_metadata$ERsign)
+
+# plot pca and find samples samples that don't separate groups
+pca_plot_rppa <- pca_data_rppa %>% ggplot(aes(PC1, PC2, color = condition, group = sample)) + geom_point(size = 5) + labs(x=paste0("PC1 (",rppa_pca_percent[1], "%)"), y=paste0("PC2 (",rppa_pca_percent[2],"%)")) + theme_classic()
+ggplotly(pca_plot_rppa, tooltip = "sample")
+
+# samples that can drop:
+## found this from plot
+## making similar removal as RNA
+out_pos_samples_rppa <- c('JIMT1_BREAST', 'MDAMB231_BREAST', 'HCC1143_BREAST', 'MDAMB436_BREAST', 'HCC1937_BREAST', 'CAL120_BREAST', 'HDQP1_BREAST', 'HS578T_BREAST', 'HMC18_BREAST', 'HCC1599_BREAST', 'BT20_BREAST', 'HCC1187_BREAST')
+out_neg_samples_rppa <- c('HCC202_BREAST')
+```
+
+```{r}
+# Final samples to take out of data
+out_samples <- c(out_pos_samples_rna, out_neg_samples_rna)
+
+# Check if samples are in data
+out_samples %in% rownames(pca_data_rna)
+out_samples %in% rownames(pca_data_rppa)
+
+# Remove cell lines from metadata
+line_metadata_filt <- line_metadata %>% rownames_to_column() %>% filter(!rownames(line_metadata) %in% out_samples)
+
+```
+
+## Sample Filtered DESeq2
+```{r}
+# Filter out samples from PCA analysis
+rnaseq_data_filt <- rnaseq_data[,!colnames(rnaseq_data) %in% out_samples]
+
+# Create DESeq dataset 
+rnaseq_DE_filt <- DESeqDataSetFromMatrix(countData = rnaseq_data_filt,
+                                    colData = line_metadata_filt,
+                                    design = ~ERsign)
+
+# Relevel so that negative cell lines are the reference
+rnaseq_DE_filt$ERsign <- relevel(rnaseq_DE_filt$ERsign, ref = "neg")
+
+# Run DE
+rnaseq_DE_filt <- DESeq(rnaseq_DE_filt)
+res_filt <- results(rnaseq_DE_filt, contrast = c("ERsign", "pos", "neg"), pAdjustMethod="fdr")
+summary(res_filt)
+
+# Get data.frame of DE genes
+res_data_filt <- as.data.frame(res_filt)
+res_data_filt <- res_data_filt[which(res_data_filt$padj < .05),]
+
+# # add gene names column
+# res_data_filt$gene_name <- rnaseq_names$Description[match(rownames(res_data_filt), rnaseq_names$Name)] 
+```
+
+## RNA-seq Filtered Batch (DESeq2) 
+```{r}
+# Get normalized counts from DESeq2 object
+rnaseq_data_normalized_1 <- log2(t(counts(rnaseq_DE_filt, normalized = T)) + 1)
+
+# Find genes with 0 variance and filter them out
+rnaseq_norm_var_1 <- apply(rnaseq_data_normalized_1, 2, var)
+var_0 <- which(rnaseq_norm_var_1 == 0)
+rnaseq_data_normalized_filt_1 <- rnaseq_data_normalized_1[,-var_0]
+
+# Run PCA
+rnaseq_norm_pca_1 <- prcomp(rnaseq_data_normalized_filt_1[,-ncol(rnaseq_data_normalized_filt_1)], scale. = T, center = T)
+
+# calculate variance explained by first two pcs
+rnaseq_norm_pca_percent_1 <- round(100*rnaseq_norm_pca_1$sdev^2/sum(rnaseq_norm_pca_1$sdev^2), 1)
+pca_data_rna_1 <- data.frame(PC1 = rnaseq_norm_pca_1$x[,1], PC2 = rnaseq_norm_pca_1$x[,2],
+                       sample = rownames(line_metadata_filt), condition = line_metadata_filt$ERsign)
+
+# plot pca and find samples samples that don't separate groups
+pca_plot_rna_1 <- pca_data_rna_1 %>% ggplot(aes(PC1, PC2, color = condition, group = sample)) + geom_point(size = 5) + labs(x=paste0("PC1 (",rnaseq_norm_pca_percent_1[1], "%)"), y=paste0("PC2 (",rnaseq_norm_pca_percent_1[2],"%)")) + theme_classic()
+ggplotly(pca_plot_rna_1, tooltip = "sample")
+```
+
+## RPPA Filtered 
+```{r}
+# Filter out samples from PCA analysis
+rppa_data_filt <- rppa_data[!rownames(rppa_data) %in% out_samples,]
+
+# Find genes with 0 variance and filter them outs
+rppa_var_1 <- apply(rppa_data_filt, 2, var)
+var_0 <- which(rppa_var_1 == 0) # no zero variance
+
+# run PCA
+rppa_pca_1 <- prcomp(rppa_data_filt, scale. = T, center = T)
+
+# calculate variance explained by first two pcs
+rppa_pca_percent_1 <- round(100*rppa_pca_1$sdev^2/sum(rppa_pca_1$sdev^2), 1)
+pca_data_rppa_1 <- data.frame(PC1 = rppa_pca_1$x[,1], PC2 = rppa_pca_1$x[,2],
+                       sample = rownames(line_metadata_filt), condition = line_metadata_filt$ERsign)
+
+# plot pca and find samples samples that don't separate groups
+pca_plot_rppa_1 <- pca_data_rppa_1 %>% ggplot(aes(PC1, PC2, color = condition, group = sample)) + geom_point(size = 5) + labs(x=paste0("PC1 (",rppa_pca_percent_1[1], "%)"), y=paste0("PC2 (",rppa_pca_percent_1[2],"%)")) + theme_classic()
+ggplotly(pca_plot_rppa_1, tooltip = "sample")
+
+
+```
+
+```{r}
+# Export final expression data
+write.csv(rnaseq_data_normalized_filt_1, file = 'pca_filtered_data/CCLE_rnaseq_normalized_filtered_041520.csv')
+write.csv(rppa_data_filt, file = 'pca_filtered_data/CCLE_rppa_filtered_041520.csv')
+
+pdf('pca_analysis_plots/CCLE_rnaseq_before_pca.pdf')
+  pca_plot_rna
+dev.off()
+
+pdf('pca_analysis_plots/CCLE_rnaseq_after_pca.pdf')
+  pca_plot_rna_1
+dev.off()
+
+pdf('pca_analysis_plots/CCLE_rppa_before_pca.pdf')
+  pca_plot_rppa
+dev.off()
+
+pdf('pca_analysis_plots/CCLE_rppa_after_pca.pdf')
+  pca_plot_rppa_1
+dev.off()
+```
+
+# Transformation of Data
+## TPM
+### Gather common genes and calculate means
+```{r}
+## RPPA data input
+CCLE_RPPA <- read.csv("CCLE_RPPA_20181003.csv", header = FALSE, colClasses = "character")
+# This code assumes that the row names are in the first column and not the rownames of the dataframe
+# and column names are in the first row
+
+# Because we are filtering rows whose first column contains "BREAST"
+# This header must contain "BREAST" because we want to keep the antibody names
+CCLE_RPPA[1,1] <- "BREAST_CELL_LINES_ONLY"
+
+CCLE_RPPA_breast <- CCLE_RPPA %>% filter(grepl("BREAST", V1))
+
+# Filter cells lines based on PCA
+CCLE_RPPA_breast <- CCLE_RPPA_breast %>% filter(!V1 %in% out_samples)
+
+# Get genes for RPPA
+CCLE_RPPA_genes <- read.csv("CCLE_RPPA_Ab_info_20181226.csv", colClasses = "character")
+CCLE_RPPA_genes <- CCLE_RPPA_genes[,1:2]
+genes <- as.character(CCLE_RPPA_genes$Target_Genes)
+
+keys <- c(genes, "gene_name")
+
+## RNASeq data input
+CCLE_RNA3 <- read.table(file = 'CCLE_RNAseq_rsem_genes_tpm_20180929.txt', sep = '\t', header = F, stringsAsFactors = F)
+
+# Convert Ensembl to gene names
+rna_gene_names <- data.frame(ensembl = CCLE_RNA3$V1[-1], ensembl_short = sapply(strsplit(CCLE_RNA3$V1[-1], split = '\\.'), `[`, 1))
+mart <- biomaRt::useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+                         dataset = "hsapiens_gene_ensembl",
+                         host = 'ensembl.org')
+t2g <- biomaRt::getBM(attributes = c("ensembl_gene_id",
+                                     "external_gene_name"), mart = mart)
+rna_gene_names$gene <- t2g$external_gene_name[match(rna_gene_names$ensembl_short, t2g$ensembl_gene_id)]
+CCLE_RNA3$V2 <- c('gene_name', rna_gene_names$gene)
+
+CCLE_RNA3$V1 <- as.character(CCLE_RNA3$V1)
+CCLE_RNA3["1","V1"] <- "Name"
+RNA_genes <- CCLE_RNA3[,1:2]
+
+# Filter the genes
+RNA_genes_filter <- RNA_genes %>%  dplyr::filter(grepl(paste(keys, collapse="|"), V2))
+
+CCLE_RNA5 <- left_join(RNA_genes_filter, CCLE_RNA3)
+
+CCLE_RNA4 <- CCLE_RNA5 %>% filter(grepl(paste(keys, collapse="|"), V2))
+
+CCLE_RNA_gene <- as.data.frame(t(CCLE_RNA4))
+CCLE_RNA_gene <- CCLE_RNA_gene %>% filter(grepl("BREAST|Name|gene_name", V1))
+
+## Find cell lines that dont match (four in RNA that aren't in RPPA that also not in the out_samples) 
+cell_line_RNA <- as.character(CCLE_RNA_gene$V1)
+cell_line_RPPA <- as.character(CCLE_RPPA_breast$V1)
+cell_line_RNA <- cell_line_RNA[3:53]
+cell_line_RPPA <- sort(cell_line_RPPA[2:35])
+cell_line_diff <- setdiff(cell_line_RNA, cell_line_RPPA)
+CCLE_RNA_filtered <- CCLE_RNA_gene %>% filter(!grepl(paste(cell_line_diff, collapse="|"), V1))
+
+# Transpose both RNA and RPPA so that genes are rows
+RNA <- as.data.frame(t(CCLE_RNA_filtered),stringsAsFactors = FALSE)
+RPPA <- as.data.frame(t(CCLE_RPPA_breast),stringsAsFactors = FALSE)
+CCLE_RPPA_genes <- rbind(CCLE_RPPA_genes, c("BREAST_CELL_LINES_ONLY", "genes"))
+RPPA <- left_join(RPPA, CCLE_RPPA_genes, by = c("V1" = "Antibody_Name"))
+# Six genes are present in the RPPA data that aren't in the RNA
+# Two because they don't have a match, and four because they are in as multiple genes
+RNA_genes <- as.character(RNA$V2)
+RNA_genes <- RNA_genes[-1]
+RPPA_genes <- RPPA$Target_Genes
+RPPA_genes <- RPPA_genes[-1]
+
+
+#### RPPA Analysis
+
+## Extract ER-alpha 
+# Create df with ER data for each cell line
+ER <- RPPA[c(1,80),]
+ER <- as.data.frame(t(ER))
+ER <- ER[2:35,]
+names(ER) = c("cell_line", "ER_val")
+ER <- ER %>% mutate(ERsign = case_when(as.numeric(as.character(ER_val)) > 0 ~ "pos",
+                                       TRUE ~ "neg")) 
+# ER Positive and Negative Vectors
+posER <- as.character(ER[ER$ERsign == "pos", 1])
+negER <- as.character(ER[ER$ERsign == "neg", 1])
+
+# Put row names where they should go
+names(RPPA) <- lapply(RPPA[1,], as.character)
+RPPA <- RPPA[-1,] 
+# Extract pos and neg cell lines, average their values in new dfs
+RPPApos <- select(RPPA, c("BREAST_CELL_LINES_ONLY", posER))
+RPPApos[,2:25] <- lapply(RPPApos[,2:25], as.character)
+RPPApos[,2:25] <- lapply(RPPApos[,2:25], as.numeric)
+RPPApos <- RPPApos %>% mutate(posRPPAaverage = rowSums(.[2:25])/24)
+RPPApos <- RPPApos[,c("BREAST_CELL_LINES_ONLY", "posRPPAaverage")]
+
+RPPAneg <- select(RPPA, c("BREAST_CELL_LINES_ONLY", negER))
+RPPAneg[,2:11] <- lapply(RPPAneg[,2:11], as.character)
+RPPAneg[,2:11] <- lapply(RPPAneg[,2:11], as.numeric)
+RPPAneg <- RPPAneg %>% mutate(negRPPAaverage = rowSums(.[2:11])/10)
+RPPAneg <- RPPAneg[,c("BREAST_CELL_LINES_ONLY", "negRPPAaverage")]
+
+RPPAfinal <- left_join(RPPApos, RPPAneg)
+RPPAfinal <- left_join(RPPAfinal, CCLE_RPPA_genes, by = c("BREAST_CELL_LINES_ONLY" = "Antibody_Name"))
+
+# Fix/remove the genes_diff
+RPPAfinal$Target_Genes <- as.character(RPPAfinal$Target_Genes)
+RPPAfinal$Target_Genes <- recode(RPPAfinal$Target_Genes, "ACACA ACACB" = "ACACA")
+RPPAfinal$Target_Genes <- recode(RPPAfinal$Target_Genes, "GSK3A GSK3B" = "GSK3B")
+RPPAfinal$Target_Genes <- recode(RPPAfinal$Target_Genes, "MAPK1 MAPK3" = "MAPK1")
+RPPAfinal$Target_Genes <- recode(RPPAfinal$Target_Genes, "RPS6KA1 RPS6KA2 RPS6KA3" = "RPS6KA3")
+RPPAfinal <- subset(RPPAfinal, Target_Genes != "AKT1 AKT2 AKT3" & Target_Genes != "PECAM1")
+
+#### RNA
+
+# Put row names where they should go
+names(RNA) <- lapply(RNA[1,], as.character)
+RNA <- RNA[-1,] 
+
+# Extract pos and neg cell lines, average their values in new dfs
+RNApos <- select(RNA, c("Name","gene_name", posER))
+RNApos[,3:26] <- lapply(RNApos[,3:26], as.character)
+RNApos[,3:26] <- lapply(RNApos[,3:26], as.numeric)
+RNApos <- RNApos %>% mutate(posRNAaverage = rowSums(.[3:26])/24)
+RNApos <- RNApos[,c("Name","gene_name","posRNAaverage")]
+
+RNAneg <- select(RNA, c("Name","gene_name",negER))
+RNAneg[,3:12] <- lapply(RNAneg[,3:12], as.character)
+RNAneg[,3:12] <- lapply(RNAneg[,3:12], as.numeric)
+RNAneg <- RNAneg %>% mutate(negRNAaverage = rowSums(.[3:12])/10)
+RNAneg <- RNAneg[,c("Name","gene_name","negRNAaverage")]
+
+RNAfinal <- left_join(RNApos, RNAneg)
+
+# Combine RPPA and RNA data
+final <- left_join(RPPAfinal, RNAfinal,  by = c("Target_Genes" = "gene_name"))
+final <- final %>% filter(!is.na(Name))
+final <- final[,c(4,1,5,2,3,6,7)]
+names(final) <- c("gene_name", "antibody_name", "RNASeq_name", 
+                  "posRPPAaverage", "negRPPAaverage", "posRNAaverage", "negRNAaverage")
+
+```
+
+### RPPA genes analysis
+```{r}
+# Change gene names in CCLE_RPPA_genes
+CCLE_RPPA_genes$Target_Genes <- recode(CCLE_RPPA_genes$Target_Genes, "ACACA ACACB" = "ACACA")
+CCLE_RPPA_genes$Target_Genes <- recode(CCLE_RPPA_genes$Target_Genes, "GSK3A GSK3B" = "GSK3B")
+CCLE_RPPA_genes$Target_Genes <- recode(CCLE_RPPA_genes$Target_Genes, "MAPK1 MAPK3" = "MAPK1")
+CCLE_RPPA_genes$Target_Genes <- recode(CCLE_RPPA_genes$Target_Genes, "RPS6KA1 RPS6KA2 RPS6KA3" = "RPS6KA3")
+CCLE_RPPA_genes <- subset(CCLE_RPPA_genes, Target_Genes != "AKT1 AKT2 AKT3" & Target_Genes != "PECAM1")
+
+# 0 = non-phosphorylated; 1 = phosphoryalted
+CCLE_RPPA_genes$phos <- ifelse(grepl("_p", CCLE_RPPA_genes$Antibody_Name), yes = 1, no = 0)
+rppa_phos_genes <- CCLE_RPPA_genes %>% filter(phos == 1) %>% select(Target_Genes) %>% unique %>% unlist(use.names = F)
+rppa_nophos_genes <- CCLE_RPPA_genes %>% filter(phos == 0) %>% select(Target_Genes) %>% unique %>% unlist(use.names = F)
+
+# genes that have non-phosphorylated and phosphorylated values
+rppa_phos_common_genes <- rppa_nophos_genes[rppa_nophos_genes %in% rppa_phos_genes] 
+
+# genes that only have phosphorylated values
+rppa_phos_genes <- rppa_phos_genes[!rppa_phos_genes %in% rppa_phos_common_genes]
+
+# genes that only have non-phosphorylated values
+rppa_nophos_genes <- rppa_nophos_genes[!rppa_nophos_genes %in% rppa_phos_common_genes]
+
+```
+
+### Calculate FC
+```{r}
+# Calculate common genes for RNA and RPPA 
+# only get total protein values/rows
+final_nophos <- final %>% filter(!grepl("_p", antibody_name))
+
+# RNA 
+final_nophos$posRNAaverage_log2 <- log2(final_nophos$posRNAaverage)
+final_nophos$negRNAaverage_log2 <- log2(final_nophos$negRNAaverage)
+final_nophos$rna_FC_log2 <- final_nophos$posRNAaverage_log2 - final_nophos$negRNAaverage_log2
+final_nophos$rna_FC <- 2^final_nophos$rna_FC_log2
+
+# RPPA
+final_nophos$rppa_FC_log2 <- final_nophos$posRPPAaverage - final_nophos$negRPPAaverage
+
+# FC with phosphorylated values
+rppa_phos_genes <- unique(final$gene_name[grepl("_p", final$antibody_name)])
+final_phos <- final %>% filter(gene_name %in% rppa_phos_genes) %>% mutate(phos = ifelse(grepl("_p", antibody_name), 1, 0))
+x <- final_phos %>% select(gene_name, phos) %>% unique() %>% dplyr::count(gene_name) %>% filter(n > 1) %>% select(gene_name) %>% unlist
+final_phos <- final_phos %>% filter(gene_name %in% x) %>% mutate(FC_log2 = posRPPAaverage - negRPPAaverage) %>% group_by(gene_name, phos) %>% top_n(1, wt = abs(FC_log2)) %>% arrange(gene_name)
+
+temp <- sapply(x, function(a) {
+  b <- final_phos %>% filter(gene_name == a)
+  b$FC_log2[b$phos == 1] / b$FC_log2[b$phos == 0]
+})
+names(temp) <- x
+
+
+final_phos_combo <- data.frame(gene_name = names(temp), 
+                               final_phos %>% group_by(gene_name) %>% select(gene_name, posRNAaverage, negRNAaverage) %>% unique %>% mutate(rna_FC_log2 = log2(posRNAaverage) - log2(negRNAaverage)) %>% select(rna_FC_log2),
+                               rppa_FC_log2 = temp, row.names = NULL)
+final_phos_combo$gene_name.1 <- NULL
+
+# final data with FC for phosphorylated and non-phosphorylated genes
+final_combo <- rbind(final_nophos[,c(1,10,12)], final_phos_combo)
+final_combo <- final_combo %>% group_by(gene_name) %>% top_n(1, wt = abs(rppa_FC_log2))
+
+```
+
+```{r}
+# Calculating all RNA gene FC
+x1 <- CCLE_RNA3[,c(1:2)]
+x1 <- x1[-1,]
+colnames(x1) <- c('ensembl', 'gene')
+x <- CCLE_RNA3[,-c(1:2)]
+x <- x[,x[1,] %in% c(posER, negER)]
+colnames(x) <- x[1,]
+x <- x[-1,]
+
+x <- apply(x, 2, as.numeric)
+rownames(x) <- x1[,1]
+
+x_pos <- as.data.frame(x[,colnames(x) %in% posER])
+x_pos$mean <- rowSums(x_pos) / ncol(x_pos)
+
+x_neg <- as.data.frame(x[,colnames(x) %in% negER])
+x_neg$mean <- rowSums(x_neg) / ncol(x_neg)
+
+RNA_FC <- cbind(x1, data.frame(rna_FC_log2 = log2(x_pos$mean) - log2(x_neg$mean)))
+RNA_FC <- RNA_FC %>% group_by(gene) %>% top_n(1, wt=abs(rna_FC_log2))
+
+```
+
+### Transform
+#### RPPA vs. RNA
+Checking if there is relationship between RPPA and RNA data
+```{r}
+# No phosphorylated values
+# # rppa log2FC vs. rna FC plot (not linear)
+# final_nophos %>% ggplot(aes(rppa_FC_log2, rna_FC)) + geom_point()
+
+# Create model rna = m*rppa + b
+lm_data <- lm(data = final_nophos, rna_FC_log2 ~ rppa_FC_log2)
+total_b <- signif(summary(lm_data)$coefficients[1,1], digits = 3)
+total_m <- signif(summary(lm_data)$coefficients[1,2], digits = 3)
+r2 <- signif(summary(lm_data)$r.squared, digits = 4) # r^2
+p <- signif(summary(lm_data)$coefficients[2,4], digits = 3) # pvalue
+lm_eq1 <- bquote('y = ' ~ .(m) ~ 'x - ' ~ .(abs(b)))
+lm_eq2 <- bquote(r^2 == .(r2))
+lm_eq3 <- bquote('p = ' ~ .(p))
+
+# rppa log2FC vs. rna log2 FC plot (look linear)
+final_nophos %>% ggplot(aes(rppa_FC_log2, rna_FC_log2)) + geom_point() + geom_smooth(method = 'lm', se = F) + annotate(geom = "text", label = lm_eq1, x = -1.9, y = 5) + annotate(geom = "text", label = lm_eq2, x = -1.9, y = 4.5) + annotate(geom = "text", label = lm_eq3, x = -1.9, y = 3.9) + theme_classic()
+
+```
+
+```{r}
+summary(final_nophos$rna_FC_log2)
+summary(final_nophos$rppa_FC_log2_trans)
+```
+
+```{r}
+# Taking out outliers
+summary(final_nophos$rppa_FC_log2)
+summary(final_nophos$rna_FC_log2)
+x <- final_nophos %>% filter(rppa_FC_log2 >= -0.303866 & rppa_FC_log2 <= 0.203708 & rna_FC_log2 >= -0.9829 & rna_FC_log2 <= 0.1268)
+summary(lm(data = x, rna_FC_log2 ~ rppa_FC_log2))
+
+final_nophos %>% filter(rppa_FC_log2 >= -0.303866 & rppa_FC_log2 <= 0.203708 & rna_FC_log2 >= -0.9829 & rna_FC_log2 <= 0.1268) %>% ggplot(aes(rppa_FC_log2, rna_FC_log2)) + geom_point()
+```
+
+```{r}
+# With phosphorylated values
+# Create model rna = m*rppa + b
+lm_data <- lm(data = final_combo, rna_FC_log2 ~ rppa_FC_log2)
+b <- signif(summary(lm_data)$coefficients[1,1], digits = 3)
+m <- signif(summary(lm_data)$coefficients[1,2], digits = 3)
+r2 <- signif(summary(lm_data)$r.squared, digits = 4) # r^2
+p <- signif(summary(lm_data)$coefficients[2,4], digits = 3) # pvalue
+lm_eq1 <- bquote('y = ' ~ .(m) ~ 'x - ' ~ .(abs(b)))
+lm_eq2 <- bquote(r^2 == .(r2))
+lm_eq3 <- bquote('p = ' ~ .(p))
+
+
+# rppa log2FC vs. rna log2 FC plot (look linear)
+final_combo %>% ggplot(aes(rppa_FC_log2, rna_FC_log2)) + geom_point() + geom_smooth(method = 'lm', se = F) + annotate(geom = "text", label = lm_eq1, x = -1.9, y = 5) + annotate(geom = "text", label = lm_eq2, x = -1.9, y = 4.5) + annotate(geom = "text", label = lm_eq3, x = -1.9, y = 3.9) + theme_classic()
+
+```
+
+### Transform
+```{r}
+# Calculate FC for all antibodies
+x <- RPPAfinal %>% mutate(rppa_FC_log2 = posRPPAaverage - negRPPAaverage)
+x$trans_rppa_FC_log2 <- total_m*x$rppa_FC_log2 + total_b
+x$phos <- CCLE_RPPA_genes$phos[match(x$BREAST_CELL_LINES_ONLY, CCLE_RPPA_genes$Antibody_Name)]
+
+# Get highest expressing genes 
+x <- x %>% group_by(Target_Genes, phos) %>% top_n(1, wt=abs(trans_rppa_FC_log2)) %>% group_by(Target_Genes) %>% top_n(1, wt=abs(trans_rppa_FC_log2)) %>% dplyr::ungroup() %>% as.data.frame()
+
+colnames(x)[1] <- 'Antibody'
+colnames(x)[4] <- 'gene'
+
+# Combine RNA and RPPA together
+combined_FC <- as.data.frame(left_join(RNA_FC, x[c(1,4,6)], by = 'gene'))
+combined_FC$rna_FC_log2[is.na(combined_FC$rna_FC_log2)] <- 0
+combined_FC$trans_rppa_FC_log2[is.na(combined_FC$trans_rppa_FC_log2)] <- 0
+combined_FC <- combined_FC[!is.na(combined_FC$gene),]
+combined_FC$is_max <- ifelse(abs(combined_FC$rna_FC_log2) > abs(combined_FC$trans_rppa_FC_log2), yes = 0, no = 1)
+combined_FC$is_max_1 <- ifelse(abs(combined_FC$rna_FC_log2) > abs(combined_FC$trans_rppa_FC_log2), yes = 0, 
+                             no = ifelse(abs(combined_FC$rna_FC_log2) == abs(combined_FC$trans_rppa_FC_log2), yes = 2, no = 1))
+
+# Get max expression for each gene
+x1 <- combined_FC[combined_FC$is_max == 0, c(2,1,4,3)]
+colnames(x1)[4] <- 'max_FC_log2'
+x2 <- combined_FC[combined_FC$is_max == 1, c(2,1,4,5)]
+colnames(x2)[4] <- 'max_FC_log2'
+max_FC <- rbind(x1, x2)
+max_FC <- max_FC[!is.infinite(max_FC$max_FC_log2),]
+#max_FC <- max_FC[max_FC$max_FC_log2 != 0,]
+summary(max_FC$max_FC_log2)
+hist(max_FC$max_FC_log2)
+
+write.csv(max_FC, file = 'CCLE_integrative/transformed_data/073120/max_FC_073120.csv')
+write.csv(max_FC, file = 'CCLE_integrative/transformed_data/073120/max_FC_1_073120.csv')
+```
+
+```{r}
+x <- combined_FC
+x <- combined_FC[!is.infinite(combined_FC$rna_FC_log2),]
+summary(x$rna_FC_log2)
+summary(x$trans_rppa_FC_log2)
+table(x$is_max)
+table(x$is_max_1)
+
+x %>% dplyr::select(gene, rna_FC_log2, trans_rppa_FC_log2) %>% reshape::melt(id.vars = 'gene') %>% ggplot(aes(variable, value, color = variable)) + geom_boxplot()
+
+x1 <- x[x$is_max == 1 & x$trans_rppa_FC_log2 != 0,]
+hist(x1$rna_FC_log2)
+hist(x1$trans_rppa_FC_log2)
+
+x2 <- reshape::melt(x1[,c('gene', 'rna_FC_log2', 'trans_rppa_FC_log2')], id = 'gene')
+
+x2 %>% ggplot(aes(value, fill = variable)) + geom_density(alpha = .5) + theme_classic()
+```
+
+# Pathway Analysis (Transformed)
+## Setup
+### RNA-only
+```{r}
+rna_gene_FC <- as.data.frame(res_filt)
+rna_gene_FC <- rna_gene_FC %>% rownames_to_column() %>% filter(!is.na(log2FoldChange))
+rna_gene_FC$gene <- rna_gene_names$gene[match(rna_gene_FC$rowname, rna_gene_names$ensembl)]
+
+x <- AnnotationDbi::select(org.Hs.eg.db, keys = rna_gene_names$gene, columns = 'ENTREZID', keytype = 'SYMBOL')
+rna_gene_FC$entrez <- x$ENTREZID[match(rna_gene_FC$gene, x$SYMBOL)]
+rna_gene_FC <- rna_gene_FC %>% filter(!is.na(entrez)) %>% dplyr::arrange(log2FoldChange) %>% dplyr::select(gene, entrez, log2FoldChange)
+
+write.table(rna_gene_FC[,2:3], file = 'CCLE_integrative/rna_only_080320/gsea_metacore/rna_all_FC.txt', sep = '\t', row.names = F, quote = F)
+
+# Get upregulated genes
+up_gene_list <- rna_gene_FC %>% filter(log2FoldChange > 2) %>% dplyr::select(entrez) %>% unlist(use.names = F) %>% as.numeric()
+
+# Get downregulated genes 
+down_gene_list <- rna_gene_FC %>% filter(log2FoldChange < -2) %>% dplyr::select(entrez) %>% unlist(use.names = F) %>% as.numeric()
+
+# Get all genes
+all_gene_list <- rna_gene_FC %>% dplyr::select(entrez) %>% unlist(use.names = F) %>% as.numeric()
+
+# Export for DAVID
+write.table(all_gene_list, file = 'CCLE_integrative/rna_only_080320/david/rna_background_genes_080320.txt', sep = '\n', row.names = F, col.names = F)
+write.table(up_gene_list, file = 'CCLE_integrative/rna_only_080320/david/rna_up_genes_080320.txt', sep = '\n', row.names = F, col.names = F)
+write.table(down_gene_list, file = 'CCLE_integrative/rna_only_080320/david/rna_down_genes_080320.txt', sep = '\n', row.names = F, col.names = F)
+
+```
+
+### DAVID
+```{r}
+# Get Entrez ID to gene
+all_gene_list <- AnnotationDbi::select(org.Hs.eg.db, keys = max_FC$gene, columns = 'ENTREZID', keytype = 'SYMBOL')
+
+# Get upregulated genes
+up_gene_list <- max_FC %>% filter(max_FC_log2 > 2) %>% dplyr::select(gene)
+up_gene_list$entrez <- all_gene_list$ENTREZID[match(up_gene_list$gene, all_gene_list$SYMBOL)]
+up_gene_list <- up_gene_list[!is.na(up_gene_list$entrez),] %>% dplyr::select(entrez) %>% unlist(use.names = F) %>% as.numeric()
+
+# Get downregulated genes 
+down_gene_list <- max_FC %>% filter(max_FC_log2 < -2) %>% dplyr::select(gene)
+down_gene_list$entrez <- all_gene_list$ENTREZID[match(down_gene_list$gene, all_gene_list$SYMBOL)]
+down_gene_list <- down_gene_list[!is.na(down_gene_list$entrez),] %>% dplyr::select(entrez) %>% unlist(use.names = F) %>% as.numeric()
+
+# Get all genes 
+all_gene_list <- all_gene_list %>% filter(!is.na(ENTREZID)) %>% dplyr::select(ENTREZID) %>% unlist(use.names = F) %>% as.numeric()
+
+write.table(all_gene_list, file = 'CCLE_integrative/int_080320/david/int_background_genes_080320.txt', sep = '\n', row.names = F, col.names = F)
+write.table(up_gene_list, file = 'CCLE_integrative/int_080320/david/int_up_genes_080320.txt', sep = '\n', row.names = F, col.names = F)
+write.table(down_gene_list, file = 'CCLE_integrative/int_080320/david/int_down_genes_080320.txt', sep = '\n', row.names = F, col.names = F)
+```
+
+### GSEA/Metacore/IPA
+```{r}
+x <- AnnotationDbi::select(org.Hs.eg.db, keys = max_FC$gene, columns = 'ENTREZID', keytype = 'SYMBOL')
+
+FC_gene_list <- max_FC[,c(1,4)]
+FC_gene_list$entrez <- x$ENTREZID[match(FC_gene_list$gene, x$SYMBOL)]
+FC_gene_list <- FC_gene_list %>% filter(!is.na(entrez)) %>% dplyr::arrange(-max_FC_log2)
+
+write.table(FC_gene_list[,c(3,2)], file = 'CCLE_integrative/int_080320/gsea_metacore/int_FC.txt', sep = '\t', row.names = F, quote = F)
+```
+
+## DAVID
+Using rna-only DAVID analysis from untransformed pathway analysis
+- up_DAVID_GO_rna
+- up_DAVID_KEGG_rna
+- down_DAVID_GO_rna
+- down_DAVID_KEGG_rna
+- down_DAVID_REACT_rna
+
+### RNA only
+```{r}
+up_DAVID_rna <- read.table('CCLE_integrative/rna_only_080320/david/rna_david_up_go_bp.txt', sep = '\t', header = T, stringsAsFactors = F)
+
+# GO
+up_DAVID_GO_rna <- up_DAVID_rna %>% filter(grepl("^GOTERM_", Category) & Benjamini < .05 & Count < 500)
+up_DAVID_GO_rna$term_filt <- sapply(up_DAVID_GO_rna$Term, function(x) strsplit(x, split = '\\~')[[1]][1])
+up_DAVID_GO_rna$description <- sapply(up_DAVID_GO_rna$Term, function(x) strsplit(x, split = '\\~')[[1]][2])
+
+up_DAVID_GO_rna %>% arrange(Count) %>% top_n(20, wt=Benjamini) %>% ggplot(aes(Count, reorder(description, Count), color = Benjamini, size = Count)) + geom_point() + xlab('Gene Count') + ylab('Pathways') + ggtitle('Top Down RNA GO Pathways (DAVID)') + theme_bw()
+
+```
+ 
+```{r}
+down_DAVID_rna <- read.table('CCLE_integrative/rna_only_080320/david/rna_david_down_go_bp.txt', sep = '\t', header = T, stringsAsFactors = F)
+
+# GO
+down_DAVID_GO_rna <- down_DAVID_rna %>% filter(grepl("^GOTERM_", Category) & Benjamini < .05 & Count < 500)
+down_DAVID_GO_rna$term_filt <- sapply(down_DAVID_GO_rna$Term, function(x) strsplit(x, split = '\\~')[[1]][1])
+down_DAVID_GO_rna$description <- sapply(down_DAVID_GO_rna$Term, function(x) strsplit(x, split = '\\~')[[1]][2])
+
+down_DAVID_GO_rna %>% arrange(Count) %>% top_n(20, wt=Benjamini) %>% ggplot(aes(Count, reorder(description, Count), color = Benjamini, size = Count)) + geom_point() + xlab('Gene Count') + ylab('Pathways') + ggtitle('Top Down RNA GO Pathways (DAVID)') + theme_bw()
+
+
+```
+
+### Integrative
+```{r}
+up_DAVID_trans <- read.table('CCLE_integrative/int_080320/david/int_david_up_go_bp.txt', sep = '\t', header = T, stringsAsFactors = F)
+
+# GO
+up_DAVID_GO_trans <- up_DAVID_trans %>% filter(grepl("^GOTERM_", Category) & Benjamini < .05 & Count < 500)
+up_DAVID_GO_trans$term_filt <- sapply(up_DAVID_GO_trans$Term, function(x) strsplit(x, split = '\\~')[[1]][1])
+up_DAVID_GO_trans$description <- sapply(up_DAVID_GO_trans$Term, function(x) strsplit(x, split = '\\~')[[1]][2])
+
+up_DAVID_GO_trans %>% arrange(Count) %>% top_n(20, wt=Benjamini) %>% ggplot(aes(Count, reorder(description, Count), color = Benjamini, size = Count)) + geom_point() + xlab('Gene Count') + ylab('Pathways') + ggtitle('Top Down Transformed Integrative GO Pathways (DAVID)') + theme_bw()
+
+```
+
+```{r}
+down_DAVID_trans <- read.table('CCLE_integrative/int_080320/david/int_david_down_go_bp.txt', sep = '\t', header = T, stringsAsFactors = F)
+
+# GO
+down_DAVID_GO_trans <- down_DAVID_trans %>% filter(grepl("^GOTERM_", Category) & Benjamini < .05 & Count < 500)
+down_DAVID_GO_trans$term_filt <- sapply(down_DAVID_GO_trans$Term, function(x) strsplit(x, split = '\\~')[[1]][1])
+down_DAVID_GO_trans$description <- sapply(down_DAVID_GO_trans$Term, function(x) strsplit(x, split = '\\~')[[1]][2])
+
+down_DAVID_GO_trans %>% arrange(Count) %>% top_n(20, wt=Benjamini) %>% ggplot(aes(Count, reorder(description, Count), color = Benjamini, size = Count)) + geom_point() + xlab('Gene Count') + ylab('Pathways') + ggtitle('Top Down Transformed Integrative GO Pathways (DAVID)') + theme_bw()
+
+```
+
+```{r}
+common_paths <- up_DAVID_GO_rna$term_filt[up_DAVID_GO_rna$term_filt %in% up_DAVID_GO_trans$term_filt]
+trans_common_path <- up_DAVID_GO_rna[match(common_paths, up_DAVID_GO_rna$term_filt), c(1, 14, 15, 4, 12)]
+trans_common_path <- trans_common_path %>% mutate(X. = X./100)
+x <- up_DAVID_GO_trans[match(common_paths, up_DAVID_GO_trans$term_filt), c(4, 12)]
+x <- x %>% mutate(X. = X./100)
+trans_common_path <- cbind(trans_common_path, x)
+colnames(trans_common_path) <- c('Category', 'Term', 'Description', 'rna_ratio', 'rna_benjamini', 'int_ratio', 'int_benjamini')
+
+x1 <- reshape::melt(trans_common_path[,c('Term', 'int_ratio', 'rna_ratio')], id = 'Term')
+x1$Description <- trans_common_path$Description[match(x1$Term, trans_common_path$Term)]
+x1 <- x1[,c(1,4,2,3)]
+x2 <- reshape::melt(trans_common_path[,c('Term', 'int_benjamini', 'rna_benjamini')], id = 'Term')
+x2$Description <- trans_common_path$Description[match(x2$Term, trans_common_path$Term)]
+x <- cbind(x1, x2[,c(2:3)])
+colnames(x) <- c('Term', 'Description', 'ratio_var', 'ratio_val', 'benjamini_var', 'benjamini_val')
+
+y <- trans_common_path %>% top_n(-20, wt=int_benjamini)
+
+x %>% filter(Term %in% y$Term) %>% ggplot(aes(ratio_val, reorder(Description, -benjamini_val), fill = ratio_var)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Gene Ratio') + xlab('Pathways') + ggtitle('Integrative vs. RNA Top Up DAVID GO Pathways') + theme_bw()
+
+x %>% filter(Term %in% y$Term) %>% ggplot(aes(ratio_var, reorder(Description, -benjamini_val), color = -log10(benjamini_val), size = ratio_val)) + geom_point() + ylab('Gene Ratio') + xlab('Pathways') + ggtitle('Transformed Integrative vs. RNA Top Up DAVID GO Pathways (FC)') + theme_bw()
+
+## down
+common_paths <- down_DAVID_GO_rna$term_filt[down_DAVID_GO_rna$term_filt %in% down_DAVID_GO_trans$term_filt]
+trans_common_path <- down_DAVID_GO_rna[match(common_paths, down_DAVID_GO_rna$term_filt), c(1, 14, 15, 4, 12)]
+trans_common_path <- trans_common_path %>% mutate(X. = X./100)
+x <- down_DAVID_GO_trans[match(common_paths, down_DAVID_GO_trans$term_filt), c(4, 12)]
+x <- x %>% mutate(X. = X./100)
+trans_common_path <- cbind(trans_common_path, x)
+colnames(trans_common_path) <- c('Category', 'Term', 'Description', 'rna_ratio', 'rna_benjamini', 'int_ratio', 'int_benjamini')
+
+x1 <- reshape::melt(trans_common_path[,c('Term', 'int_ratio', 'rna_ratio')], id = 'Term')
+x1$Description <- trans_common_path$Description[match(x1$Term, trans_common_path$Term)]
+x1 <- x1[,c(1,4,2,3)]
+x2 <- reshape::melt(trans_common_path[,c('Term', 'int_benjamini', 'rna_benjamini')], id = 'Term')
+x2$Description <- trans_common_path$Description[match(x2$Term, trans_common_path$Term)]
+x <- cbind(x1, x2[,c(2:3)])
+colnames(x) <- c('Term', 'Description', 'ratio_var', 'ratio_val', 'benjamini_var', 'benjamini_val')
+
+y <- trans_common_path %>% top_n(-20, wt=int_benjamini)
+
+x %>% filter(Term %in% y$Term) %>% ggplot(aes(ratio_val, reorder(Description, -benjamini_val), fill = ratio_var)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Gene Ratio') + xlab('Pathways') + ggtitle('Integrative vs. RNA Top Down DAVID GO Pathways') + theme_bw()
+
+x %>% filter(Term %in% y$Term) %>% ggplot(aes(ratio_var, reorder(Description, -benjamini_val), color = -log10(benjamini_val), size = ratio_val)) + geom_point() + ylab('Gene Ratio') + xlab('Pathways') + ggtitle('Transformed Integrative vs. RNA Top Down DAVID GO Pathways (FC)') + theme_bw()
+```
+
+## MetaCore (FC)
+```{r}
+metacore_up_FC_trans <- read.csv('CCLE_integrative/david_integrative_analysis/070120/metacore/up_FC_paths_metacore_070120.csv', skip = 2, stringsAsFactors = F, header = T)
+metacore_up_FC_trans <- metacore_up_FC_trans[,-c(1,ncol(metacore_up_FC_trans))]
+colnames(metacore_up_FC_trans) <- c('Maps', 'Total', 'min_pvalue', 'min_FDR', 'int_pvalue', 'int_FDR', 'int_count', 'int_genes', 'rna_pvalue', 'rna_FDR', 'rna_count', 'rna_genes')
+metacore_up_FC_trans <- metacore_up_FC_trans %>% mutate(int_ratio = int_count / Total, rna_ratio = rna_count / Total)
+
+x1 <- reshape::melt(metacore_up_FC_trans[,c('Maps', 'int_ratio', 'rna_ratio')], id = 'Maps')
+x2 <- reshape::melt(metacore_up_FC_trans[,c('Maps', 'int_FDR', 'rna_FDR')], id = 'Maps')
+x <- cbind(x1, x2[,c(2:3)])
+colnames(x) <- c('Maps', 'ratio_var', 'ratio_val', 'FDR_var', 'FDR_val')
+
+y <- metacore_up_FC_trans %>% top_n(-20, wt=min_FDR)
+
+x %>% filter(Maps %in% y$Maps) %>% ggplot(aes(ratio_val, reorder(Maps, -FDR_val), fill = ratio_var)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Gene Ratio') + xlab('Pathways') + ggtitle('Transformed Integrative vs. RNA Top Up Metacore Pathways (FC)') + theme_bw()
+
+x %>% filter(Maps %in% y$Maps) %>% ggplot(aes(ratio_var, reorder(Maps, -FDR_val), color = -log10(FDR_val), size = ratio_val)) + geom_point() + ylab('Gene Ratio') + xlab('Pathways') + ggtitle('Transformed Integrative vs. RNA Top Up Metacore Pathways (FC)') + theme_bw()
+```
+
+```{r}
+metacore_down_FC_trans <- read.csv('CCLE_integrative/david_integrative_analysis/070120/metacore/down_FC_paths_metacore_070120.csv', skip = 2, stringsAsFactors = F, header = T)
+metacore_down_FC_trans <- metacore_down_FC_trans[,-c(1,ncol(metacore_down_FC_trans))]
+colnames(metacore_down_FC_trans) <- c('Maps', 'Total', 'min_pvalue', 'min_FDR', 'int_pvalue', 'int_FDR', 'int_count', 'int_genes', 'rna_pvalue', 'rna_FDR', 'rna_count', 'rna_genes')
+metacore_down_FC_trans <- metacore_down_FC_trans %>% mutate(int_ratio = int_count / Total, rna_ratio = rna_count / Total)
+
+x1 <- reshape::melt(metacore_down_FC_trans[,c('Maps', 'int_ratio', 'rna_ratio')], id = 'Maps')
+x2 <- reshape::melt(metacore_down_FC_trans[,c('Maps', 'int_FDR', 'rna_FDR')], id = 'Maps')
+x <- cbind(x1, x2[,c(2:3)])
+colnames(x) <- c('Maps', 'ratio_var', 'ratio_val', 'FDR_var', 'FDR_val')
+
+y <- metacore_down_FC_trans %>% top_n(-20, wt=min_FDR)
+
+x %>% filter(Maps %in% y$Maps) %>% ggplot(aes(ratio_val, reorder(Maps, -FDR_val), fill = ratio_var)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Gene Ratio') + xlab('Pathways') + ggtitle('Transformed Integrative vs. RNA Top Down Metacore Pathways (FC)') + theme_bw()
+
+x %>% filter(Maps %in% y$Maps) %>% ggplot(aes(ratio_var, reorder(Maps, -FDR_val), color = -log10(FDR_val), size = ratio_val)) + geom_point() + ylab('Gene Ratio') + xlab('Pathways') + ggtitle('Transformed Integrative vs. RNA Top Down Metacore Pathways (FC)') + theme_bw()
+```
+
+## GSEA (clusterProfiler)
+- rna_gene_FC
+- FC_gene_list
+
+```{r}
+msigdb_c2 <- msigdbr('Homo sapiens', category = 'C2') %>% dplyr::select(gs_name, entrez_gene)
+```
+
+```{r}
+# Create Entrez-FC vectors
+int_trans_FC_gsea_list <- FC_gene_list$max_FC_log2
+names(int_trans_FC_gsea_list) <- FC_gene_list$entrez
+
+rna_FC_gsea_list <- rna_gene_FC$log2FoldChange
+names(rna_FC_gsea_list) <- rna_gene_FC$entrez
+rna_FC_gsea_list <- sort(rna_FC_gsea_list, decreasing = T)
+
+# Run GSEA
+int_trans_gsea <- GSEA(int_trans_FC_gsea_list, TERM2GENE = msigdb_c2, pvalueCutoff = 1, nPerm = 1000)
+rna_gsea <- GSEA(rna_FC_gsea_list, TERM2GENE = msigdb_c2, pvalueCutoff = 1, nPerm = 1000)
+
+# Full path tables
+int_trans_gsea_all <- int_trans_gsea@result
+rna_gsea_all <- rna_gsea@result
+int_rna_paths_merge_table <- merge(int_trans_gsea_all, rna_gsea_all, by = 'ID', all = T)
+int_rna_paths_merge_table <- int_rna_paths_merge_table %>% dplyr::select(-c(Description.x, rank.x, leading_edge.x, Description.y, rank.y, leading_edge.y)) %>% rename(path = ID, int_setSize = setSize.x, int_ES = enrichmentScore.x, int_NES = NES.x, int_pval = pvalue.x, int_padj = p.adjust.x, int_qval = qvalues.x, int_genes = core_enrichment.x, rna_setSize = setSize.y, rna_ES = enrichmentScore.y, rna_NES = NES.y, rna_pval = pvalue.y, rna_padj = p.adjust.y, rna_qval = qvalues.y, rna_genes = core_enrichment.y)
+int_rna_paths_merge_table$int_NES[is.na(int_rna_paths_merge_table$int_NES)] <- 0
+int_rna_paths_merge_table$rna_NES[is.na(int_rna_paths_merge_table$rna_NES)] <- 0
+int_rna_paths_merge_table$int_pval[is.na(int_rna_paths_merge_table$int_pval)] <- 1
+int_rna_paths_merge_table$rna_pval[is.na(int_rna_paths_merge_table$rna_pval)] <- 1
+int_rna_paths_merge_table$int_qval[is.na(int_rna_paths_merge_table$int_qval)] <- 1
+int_rna_paths_merge_table$rna_qval[is.na(int_rna_paths_merge_table$rna_qval)] <- 1
+
+# Significant path tables (common pathways)
+int_trans_gsea_sig <- int_trans_gsea_all %>% filter(p.adjust < .05)
+rna_gsea_all_sig <- rna_gsea_all %>% filter(p.adjust < .05)
+int_rna_paths_merge_table_sig <- merge(int_trans_gsea_sig, rna_gsea_all_sig, by = 'ID')
+int_rna_paths_merge_table_sig <- int_rna_paths_merge_table_sig %>% dplyr::select(-c(Description.x, rank.x, leading_edge.x, Description.y, rank.y, leading_edge.y)) %>% rename(path = ID, int_setSize = setSize.x, int_ES = enrichmentScore.x, int_NES = NES.x, int_pval = pvalue.x, int_padj = p.adjust.x, int_qval = qvalues.x, int_genes = core_enrichment.x, rna_setSize = setSize.y, rna_ES = enrichmentScore.y, rna_NES = NES.y, rna_pval = pvalue.y, rna_padj = p.adjust.y, rna_qval = qvalues.y, rna_genes = core_enrichment.y)
+int_rna_paths_merge_table_sig$int_NES[is.na(int_rna_paths_merge_table_sig$int_NES)] <- 0
+int_rna_paths_merge_table_sig$rna_NES[is.na(int_rna_paths_merge_table_sig$rna_NES)] <- 0
+int_rna_paths_merge_table_sig$int_pval[is.na(int_rna_paths_merge_table_sig$int_pval)] <- 1
+int_rna_paths_merge_table_sig$rna_pval[is.na(int_rna_paths_merge_table_sig$rna_pval)] <- 1
+
+```
+
+```{r}
+# Upregulated paths
+up <- int_rna_paths_merge_table %>% filter(int_NES > 0)
+x1 <- reshape::melt(up[,c('path', 'int_NES', 'rna_NES')], id = 'path')
+x2 <- reshape::melt(up[,c('path', 'int_pval', 'rna_pval')], id = 'path')
+x <- cbind(x1, x2[,2:3])
+colnames(x) <- c('path', 'NES_var', 'NES_val', 'pval_var', 'pval_val')
+
+y <- up %>% top_n(-20, int_pval)
+
+x %>% filter(path %in% y$path) %>% ggplot(aes(NES_val, reorder(path, -pval_val), fill = NES_var)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('NES') + xlab('Pathways') + ggtitle('Transformed Integrative vs. RNA Top Up GSEA Pathways') + theme_bw()
+
+x %>% filter(path %in% y$path) %>% ggplot(aes(NES_var, reorder(path, -pval_val), color = -log10(pval_val), size = NES_val)) + geom_point() + ylab('NES') + xlab('Pathways') + ggtitle('Transformed Integrative vs. RNA Top Up GSEA Pathways') + theme_bw()
+
+# Downregulated paths
+down <- int_rna_paths_merge_table %>% filter(int_NES < 0)
+x1 <- reshape::melt(down[,c('path', 'int_NES', 'rna_NES')], id = 'path')
+x2 <- reshape::melt(down[,c('path', 'int_pval', 'rna_pval')], id = 'path')
+x <- cbind(x1, x2[,2:3])
+colnames(x) <- c('path', 'NES_var', 'NES_val', 'pval_var', 'pval_val')
+
+y <- down %>% top_n(-20, int_pval)
+
+x %>% filter(path %in% y$path) %>% ggplot(aes(abs(NES_val), reorder(path, -pval_val), fill = NES_var)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('NES') + xlab('Pathways') + ggtitle('Transformed Integrative vs. RNA Top Down GSEA Pathways') + theme_bw()
+
+x %>% filter(path %in% y$path) %>% ggplot(aes(NES_var, reorder(path, -pval_val), color = -log10(pval_val), size = abs(NES_val))) + geom_point() + ylab('NES') + xlab('Pathways') + ggtitle('Transformed Integrative vs. RNA Top Down GSEA Pathways') + theme_bw()
+
+```
+
+```{r}
+hist(rna_FC_gsea_list)
+hist(int_trans_FC_gsea_list)
+```
+
+Combinations:
+- same sign; both significant (1)
+- same sign; both not significant (0) not interesting
+- same sign; int sig & rna not sig (2)
+- same sign; int not sig & rna sig (3)
+- diff sign; both significant (4)
+- diff sign; both not significant (0) not interesting
+- diff sign; int sig & rna not sig (5)
+- diff sign; int not sig & rna sig (6)
+
+```{r}
+x <- int_rna_paths_merge_table %>% dplyr:: select(path, int_NES, rna_NES, int_qval, rna_qval)
+
+x$type <- 0
+x$type[(sign(x$int_NES) == sign(x$rna_NES)) & (x$int_qval < .05 & x$rna_qval < .05)] <- 1
+x$type[(sign(x$int_NES) == sign(x$rna_NES)) & (x$int_qval < .05 & x$rna_qval > .05)] <- 2
+x$type[(sign(x$int_NES) == sign(x$rna_NES)) & (x$int_qval > .05 & x$rna_qval < .05)] <- 3
+x$type[(sign(x$int_NES) != sign(x$rna_NES)) & (x$int_qval < .05 & x$rna_qval < .05)] <- 4
+x$type[(sign(x$int_NES) != sign(x$rna_NES)) & (x$int_qval < .05 & x$rna_qval > .05)] <- 5
+x$type[(sign(x$int_NES) != sign(x$rna_NES)) & (x$int_qval > .05 & x$rna_qval < .05)] <- 6
+
+x <- x[x$type != 0,]
+table(x$type)
+```
+
+```{r}
+y <- x[x$type == 2,]
+
+a1 <- reshape::melt(y[,c('path', 'int_NES', 'rna_NES')], id = 'path')
+a2 <- reshape::melt(y[,c('path', 'int_qval', 'rna_qval')], id = 'path')
+a <- cbind(a1, a2[,2:3])
+colnames(a) <- c('path', 'NES_var', 'NES_val', 'qval_var', 'qval_val')
+
+a %>% ggplot(aes(NES_val, reorder(path, qval_val), fill = NES_var)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('NES') + xlab('Pathways') + ggtitle('Transformed Integrative vs. RNA Int Significant GSEA Pathways') + theme_bw()
+
+a %>% ggplot(aes(NES_var, reorder(path, qval_val), color = -log10(qval_val), size = NES_val)) + geom_point() + xlab('NES') + ylab('Pathwabs') + ggtitle('Transformed Integrative vs. RNA Int Significant GSEA Pathways') + theme_bw()
+```
+
+
