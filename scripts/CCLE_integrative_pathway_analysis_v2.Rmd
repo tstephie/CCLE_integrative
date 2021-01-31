@@ -1,0 +1,1990 @@
+---
+title: "CCLE_integrative_pathway_analysis_v2"
+author: "Stephanie The"
+date: "4/2/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load in packages
+library(tidyverse)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(msigdbr)
+library(ggplot2)
+library(ggfortify)
+library(gPCA)
+library(plotly)
+library(DESeq2)
+
+# Set directory
+setwd("~/tutorial_r/integrative/CCLE")
+```
+
+# RNA-seq normalization and DE analysis (DESeq2)
+```{r}
+# Load in raw counts for RNA-seq
+rnaseq_data <- read.delim2(file = 'CCLE_RNAseq_genes_counts_20180929.gct', sep = '\t', skip = 2, header = T,stringsAsFactors = F)
+rnaseq_names <- rnaseq_data[,1:2]
+
+# Load in metadata on breast cancer cell lines (positive or negative)
+line_metadata <- read.csv('breast_cell_lines_V2.csv', header = T, stringsAsFactors = F, row.names = 1)
+line_metadata$ERsign <- as.factor(line_metadata$ERsign)
+
+# Get only breast cancer cell lines 
+rnaseq_data <- rnaseq_data[,match(rownames(line_metadata), colnames(rnaseq_data))]
+rownames(rnaseq_data) <- rnaseq_names$Name
+all(rownames(line_metadata) == colnames(rnaseq_data)) # Check if got the right cell lines
+
+# Create DESeq dataset 
+rnaseq_DE <- DESeqDataSetFromMatrix(countData = rnaseq_data,
+                                    colData = line_metadata,
+                                    design = ~ERsign)
+
+# Relevel so that negative cell lines are the reference
+rnaseq_DE$ERsign <- relevel(rnaseq_DE$ERsign, ref = "neg")
+
+# Run DE
+rnaseq_DE <- DESeq(rnaseq_DE)
+res <- results(rnaseq_DE, contrast = c("ERsign", "neg", "pos"), pAdjustMethod="fdr")
+summary(res)
+
+# Get data.frame of DE genes
+res_data <- as.data.frame(res)
+res_data <- res_data[which(res_data$padj < .05),]
+
+# add gene names column
+res_data$gene_name <- rnaseq_names$Description[match(rownames(res_data), rnaseq_names$Name)] 
+
+```
+
+# Batch Effect Analysis
+## RNA-seq (DESeq2)
+```{r}
+# Get normalized counts from DESeq2 object
+rnaseq_data_normalized <- log2(t(counts(rnaseq_DE, normalized = T)) + 1)
+
+# Find genes with 0 variance and filter them out
+rnaseq_norm_var <- apply(rnaseq_data_normalized, 2, var)
+var_0 <- which(rnaseq_norm_var == 0)
+rnaseq_data_normalized_filt <- rnaseq_data_normalized[,-var_0]
+
+# Run PCA
+rnaseq_norm_pca <- prcomp(rnaseq_data_normalized_filt, scale. = T, center = T)
+
+# calculate variance explained by first two pcs
+rnaseq_norm_pca_percent <- round(100*rnaseq_norm_pca$sdev^2/sum(rnaseq_norm_pca$sdev^2), 1)
+pca_data_rna <- data.frame(PC1 = rnaseq_norm_pca$x[,1], PC2 = rnaseq_norm_pca$x[,2],
+                       sample = rownames(line_metadata), condition = line_metadata$ERsign)
+
+# plot pca and find samples samples that don't separate groups
+pca_plot_rna <- pca_data_rna %>% ggplot(aes(PC1, PC2, color = condition, group = sample)) + geom_point(size = 5) + labs(x=paste0("PC1 (",rnaseq_norm_pca_percent[1], "%)"), y=paste0("PC2 (",rnaseq_norm_pca_percent[2],"%)")) + theme_classic()
+ggplotly(pca_plot_rna, tooltip = "sample")
+
+# samples that can drop:
+## found this from plot
+out_pos_samples_rna <- c('BT20_BREAST', 'JIMT1_BREAST', 'HCC1937_BREAST', 'HMC18_BREAST', 'MDAMB231_BREAST', 'MDAMB436_BREAST', 'CAL120_BREAST', 'HDQP1_BREAST', 'HCC1187_BREAST', 'HCC1143_BREAST', 'HS578T_BREAST', 'HCC1599_BREAST')
+out_neg_samples_rna <- c('HCC202_BREAST')
+
+# Check if samples are in data
+out_pos_samples_rna %in% rownames(pca_data_rna)
+
+```
+
+## RPPA
+```{r}
+# Load in data
+rppa_data <- read.csv(file = 'CCLE_RPPA_20181003.csv', header = T, stringsAsFactors = F, check.names = F)
+rownames(rppa_data) <- rppa_data[,1]
+rppa_data[,1] <- NULL
+
+# Get only breast cancer cell lines 
+rppa_data <- rppa_data[match(rownames(line_metadata), rownames(rppa_data)),]
+all(rownames(line_metadata) == rownames(rppa_data)) # Check if got the right cell lines
+
+# Find genes with 0 variance and filter them outs
+rppa_var <- apply(rppa_data, 2, var)
+var_0 <- which(rppa_var == 0) # no zero variance
+
+# run PCA
+rppa_pca <- prcomp(rppa_data, scale. = T, center = T)
+
+# calculate variance explained by first two pcs
+rppa_pca_percent <- round(100*rppa_pca$sdev^2/sum(rppa_pca$sdev^2), 1)
+pca_data_rppa <- data.frame(PC1 = rppa_pca$x[,1], PC2 = rppa_pca$x[,2],
+                       sample = rownames(line_metadata), condition = line_metadata$ERsign)
+
+# plot pca and find samples samples that don't separate groups
+pca_plot_rppa <- pca_data_rppa %>% ggplot(aes(PC1, PC2, color = condition, group = sample)) + geom_point(size = 5) + labs(x=paste0("PC1 (",rppa_pca_percent[1], "%)"), y=paste0("PC2 (",rppa_pca_percent[2],"%)")) + theme_classic()
+ggplotly(pca_plot_rppa, tooltip = "sample")
+
+# samples that can drop:
+## found this from plot
+## making similar removal as RNA
+out_pos_samples_rppa <- c('JIMT1_BREAST', 'MDAMB231_BREAST', 'HCC1143_BREAST', 'MDAMB436_BREAST', 'HCC1937_BREAST', 'CAL120_BREAST', 'HDQP1_BREAST', 'HS578T_BREAST', 'HMC18_BREAST', 'HCC1599_BREAST', 'BT20_BREAST', 'HCC1187_BREAST')
+out_neg_samples_rppa <- c('HCC202_BREAST')
+```
+
+```{r}
+# Final samples to take out of data
+out_samples <- c(out_pos_samples_rna, out_neg_samples_rna)
+
+# Check if samples are in data
+out_samples %in% rownames(pca_data_rna)
+out_samples %in% rownames(pca_data_rppa)
+
+# Remove cell lines from metadata
+line_metadata_filt <- line_metadata %>% rownames_to_column() %>% filter(!rownames(line_metadata) %in% out_samples)
+
+```
+
+
+## Sample Filtered DESeq2
+```{r}
+# Filter out samples from PCA analysis
+rnaseq_data_filt <- rnaseq_data[,!colnames(rnaseq_data) %in% out_samples]
+
+# Create DESeq dataset 
+rnaseq_DE_filt <- DESeqDataSetFromMatrix(countData = rnaseq_data_filt,
+                                    colData = line_metadata_filt,
+                                    design = ~ERsign)
+
+# Relevel so that negative cell lines are the reference
+rnaseq_DE_filt$ERsign <- relevel(rnaseq_DE_filt$ERsign, ref = "neg")
+
+# Run DE
+rnaseq_DE_filt <- DESeq(rnaseq_DE_filt)
+res_filt <- results(rnaseq_DE_filt, contrast = c("ERsign", "neg", "pos"), pAdjustMethod="fdr")
+summary(res_filt)
+
+# Get data.frame of DE genes
+res_data_filt <- as.data.frame(res_filt)
+res_data_filt <- res_data_filt[which(res_data_filt$padj < .05),]
+
+# add gene names column
+res_data_filt$gene_name <- rnaseq_names$Description[match(rownames(res_data_filt), rnaseq_names$Name)] 
+```
+
+## RNA-seq Filtered Batch (DESeq2) 
+```{r}
+# Get normalized counts from DESeq2 object
+rnaseq_data_normalized_1 <- log2(t(counts(rnaseq_DE_filt, normalized = T)) + 1)
+
+# Find genes with 0 variance and filter them out
+rnaseq_norm_var_1 <- apply(rnaseq_data_normalized_1, 2, var)
+var_0 <- which(rnaseq_norm_var_1 == 0)
+rnaseq_data_normalized_filt_1 <- rnaseq_data_normalized_1[,-var_0]
+
+# Run PCA
+rnaseq_norm_pca_1 <- prcomp(rnaseq_data_normalized_filt_1[,-ncol(rnaseq_data_normalized_filt_1)], scale. = T, center = T)
+
+# calculate variance explained by first two pcs
+rnaseq_norm_pca_percent_1 <- round(100*rnaseq_norm_pca_1$sdev^2/sum(rnaseq_norm_pca_1$sdev^2), 1)
+pca_data_rna_1 <- data.frame(PC1 = rnaseq_norm_pca_1$x[,1], PC2 = rnaseq_norm_pca_1$x[,2],
+                       sample = rownames(line_metadata_filt), condition = line_metadata_filt$ERsign)
+
+# plot pca and find samples samples that don't separate groups
+pca_plot_rna_1 <- pca_data_rna_1 %>% ggplot(aes(PC1, PC2, color = condition, group = sample)) + geom_point(size = 5) + labs(x=paste0("PC1 (",rnaseq_norm_pca_percent_1[1], "%)"), y=paste0("PC2 (",rnaseq_norm_pca_percent_1[2],"%)")) + theme_classic()
+ggplotly(pca_plot_rna_1, tooltip = "sample")
+```
+
+## RPPA Filtered 
+```{r}
+# Filter out samples from PCA analysis
+rppa_data_filt <- rppa_data[!rownames(rppa_data) %in% out_samples,]
+
+# Find genes with 0 variance and filter them outs
+rppa_var_1 <- apply(rppa_data_filt, 2, var)
+var_0 <- which(rppa_var_1 == 0) # no zero variance
+
+# run PCA
+rppa_pca_1 <- prcomp(rppa_data_filt, scale. = T, center = T)
+
+# calculate variance explained by first two pcs
+rppa_pca_percent_1 <- round(100*rppa_pca_1$sdev^2/sum(rppa_pca_1$sdev^2), 1)
+pca_data_rppa_1 <- data.frame(PC1 = rppa_pca_1$x[,1], PC2 = rppa_pca_1$x[,2],
+                       sample = rownames(line_metadata_filt), condition = line_metadata_filt$ERsign)
+
+# plot pca and find samples samples that don't separate groups
+pca_plot_rppa_1 <- pca_data_rppa_1 %>% ggplot(aes(PC1, PC2, color = condition, group = sample)) + geom_point(size = 5) + labs(x=paste0("PC1 (",rppa_pca_percent_1[1], "%)"), y=paste0("PC2 (",rppa_pca_percent_1[2],"%)")) + theme_classic()
+ggplotly(pca_plot_rppa_1, tooltip = "sample")
+
+
+```
+
+```{r}
+# Export final expression data
+write.csv(rnaseq_data_normalized_filt_1, file = 'pca_filtered_data/CCLE_rnaseq_normalized_filtered_041520.csv')
+write.csv(rppa_data_filt, file = 'pca_filtered_data/CCLE_rppa_filtered_041520.csv')
+
+pdf('pca_analysis_plots/CCLE_rnaseq_before_pca.pdf')
+  pca_plot_rna
+dev.off()
+
+pdf('pca_analysis_plots/CCLE_rnaseq_after_pca.pdf')
+  pca_plot_rna_1
+dev.off()
+
+pdf('pca_analysis_plots/CCLE_rppa_before_pca.pdf')
+  pca_plot_rppa
+dev.off()
+
+pdf('pca_analysis_plots/CCLE_rppa_after_pca.pdf')
+  pca_plot_rppa_1
+dev.off()
+```
+
+# Transformation of Data
+This is done by Nick. Transformed RNA values to RPPA expression space. 
+```{r}
+# Load in integrative and rna-seq only genes
+integrate_transform_rpkm <- read.csv('CCLE_integrative/transformed_data/final_RPKM_RNA2RPPA_CCLE_analysis_V2.csv', header = T, stringsAsFactors = F)
+integrate_transform_tpm <- read.csv('CCLE_integrative/transformed_data/final_TPM_RNA2RPPA_CCLE_analysis_V2.csv', header = T, stringsAsFactors = F)
+
+rna_transform_rpkm <- read.csv('CCLE_integrative/transformed_data/RPKM_RNA_only_transform_V2.csv', header = T, stringsAsFactors = F)
+rna_transform_rpkm$Description <- rnaseq_names$Description
+rna_transform_rpkm <- rna_transform_rpkm[!rna_transform_rpkm$Description %in% integrate_transform_rpkm$gene_name,]
+
+rna_transform_tpm <- read.csv('CCLE_integrative/transformed_data/TPM_RNA_only_transform_V2.csv', header = T, stringsAsFactors = F)
+rna_transform_tpm$Description <- rnaseq_names$Description
+rna_transform_tpm <- rna_transform_tpm[!rna_transform_tpm$Description %in% integrate_transform_tpm$gene_name,]
+
+# Merge FC of gene lists together and getting rid of duplicates
+full_transform_rpkm <- integrate_transform_rpkm[,c(2,9)]
+full_transform_rpkm <- rbind(full_transform_rpkm, data.frame(gene_name = rna_transform_rpkm$Description, max_log_FC = rna_transform_rpkm$log2RPPAFC))
+full_transform_rpkm <- full_transform_rpkm %>% group_by(gene_name) %>% top_n(1, abs(max_log_FC)) %>% unique()
+
+full_transform_tpm <- integrate_transform_tpm[,c(1,8)]
+full_transform_tpm <- rbind(full_transform_tpm, data.frame(gene_name = rna_transform_tpm$Description, max_log_FC = rna_transform_tpm$log2RPPAFC))
+full_transform_tpm <- full_transform_tpm %>% group_by(gene_name) %>% top_n(1, abs(max_log_FC)) %>% unique()
+
+```
+
+# Pathways Database
+Using MSIGDB (Category 2) 
+```{r}
+msigdb_c2 <- msigdbr('Homo sapiens', category = 'C2') %>% dplyr::select(gs_name, entrez_gene)
+```
+
+# RNA-seq Only Pathway Analysis 
+From DESeq2 results, I take those DE genes (adj_p < .05) and put them through pathway analyses (GSEA, functional enrichment)
+
+## Pathway analysis
+Using only log2 FC so I can compare to the integrative dataset
+
+### Setting up 
+```{r}
+# get full DE list
+rna_deseq2 <- as.data.frame(res)
+rna_deseq2$gene_name <- rnaseq_names$Description
+rna_deseq2 <- rna_deseq2[!is.na(rna_deseq2$log2FoldChange),]
+rna_deseq2 <- rna_deseq2 %>% rownames_to_column() %>% group_by(gene_name) %>% top_n(1, abs(log2FoldChange)) %>% filter(!duplicated(gene_name))
+
+# Make gene FC list from RNA-seq DE
+rnaseq_orig_gene_list <- rna_deseq2$log2FoldChange
+names(rnaseq_orig_gene_list) <- rna_deseq2$gene_name
+rnaseq_orig_gene_list <- sort(rnaseq_orig_gene_list, decreasing = T)
+summary(rna_deseq2$log2FoldChange)
+
+# Convert gene names to ENTREZID
+rnaseq_orig_gene_convert <- bitr(names(rnaseq_orig_gene_list), fromType = 'SYMBOL', toType = 'ENTREZID', OrgDb = "org.Hs.eg.db", drop = F)
+dup_symbols <- rnaseq_orig_gene_convert$SYMBOL[duplicated(rnaseq_orig_gene_convert$SYMBOL)]
+dup_convert <- rnaseq_orig_gene_convert[rnaseq_orig_gene_convert$SYMBOL %in% dup_symbols,]
+rnaseq_orig_gene_convert <- rnaseq_orig_gene_convert[!duplicated(rnaseq_orig_gene_convert$SYMBOL),]
+
+# Get valid ENTREZID genes 
+rnaseq_orig_gene_list <- rnaseq_orig_gene_list[names(rnaseq_orig_gene_list) %in% rnaseq_orig_gene_convert$SYMBOL]
+names(rnaseq_orig_gene_list) <- rnaseq_orig_gene_convert$ENTREZID[match(names(rnaseq_orig_gene_list), rnaseq_orig_gene_convert$SYMBOL)]
+rnaseq_orig_gene_list <- rnaseq_orig_gene_list[!is.na(names(rnaseq_orig_gene_list))]
+
+# look at distribution of FC 
+hist(rnaseq_orig_gene_list)
+
+```
+
+### Function Enrichment
+```{r}
+# gene list with abs(FC) > 2
+rnaseq_orig_gene_list_filt <- rnaseq_orig_gene_list[abs(rnaseq_orig_gene_list) >= 2]
+
+# DAVID
+up_genes <- rnaseq_orig_gene_list_filt[rnaseq_orig_gene_list_filt > 0]
+down_genes <- rnaseq_orig_gene_list_filt[rnaseq_orig_gene_list_filt < 0]
+
+write.table(as.numeric(names(rnaseq_orig_gene_list)), file = 'CCLE_integrative/david_rna_only_analysis/background_genes.txt', sep = '\n', row.names = F, col.names = F)
+write.table(as.numeric(names(up_genes)), file = 'CCLE_integrative/david_rna_only_analysis/up_genes.txt', sep = '\n', row.names = F, col.names = F)
+write.table(as.numeric(names(down_genes)), file = 'CCLE_integrative/david_rna_only_analysis/down_genes.txt', sep = '\n', row.names = F, col.names = F)
+
+# clusterProfiler
+## GO
+rnaseq_orig_up_GO <- enrichGO(names(up_genes), universe = names(rnaseq_orig_gene_list), OrgDb = org.Hs.eg.db, ont = 'ALL', pvalueCutoff = 1, qvalueCutoff = 1)
+rnaseq_orig_down_GO <- enrichGO(names(down_genes), universe = names(rnaseq_orig_gene_list), OrgDb = org.Hs.eg.db, ont = 'ALL', pvalueCutoff = 1, qvalueCutoff = 1)
+
+## KEGG
+rnaseq_orig_up_KEGG <- enrichKEGG(names(up_genes), universe = names(rnaseq_orig_gene_list), organism = 'hsa', pvalueCutoff = 1, qvalueCutoff = 1)
+rnaseq_orig_down_KEGG <- enrichKEGG(names(down_genes), universe = names(rnaseq_orig_gene_list), organism = 'hsa', pvalueCutoff = 1, qvalueCutoff = 1)
+
+## Reactome
+rnaseq_orig_up_reactome <- enrichPathway(names(up_genes), universe = names(rnaseq_orig_gene_list), organism = 'human', pvalueCutoff = 1, qvalueCutoff = 1)
+rnaseq_orig_down_reactome <- enrichPathway(names(down_genes), universe = names(rnaseq_orig_gene_list), organism = 'human', pvalueCutoff = 1, qvalueCutoff = 1)
+
+# ## MSigDB
+# rnaseq_orig_up_msigdb <- enricher(names(up_genes), universe = names(rnaseq_orig_gene_list), TERM2GENE = msigdb_c2)
+# rnaseq_orig_down_msigdb <- enricher(names(down_genes), universe = names(rnaseq_orig_gene_list), TERM2GENE = msigdb_c2)
+
+```
+
+#### Comparing CP and DAVID
+```{r}
+## GO
+up_rna_DAVID_GO <- read.table('CCLE_integrative/david_rna_only_analysis/david_rna_up_genes_GO_052020.txt', sep = '\t', header = T, stringsAsFactors = F)
+up_rna_DAVID_GO$term_filt <- sapply(up_rna_DAVID_GO$Term, function(x) strsplit(x, split = '\\~')[[1]][1])
+up_rna_DAVID_GO <- up_rna_DAVID_GO[up_rna_DAVID_GO$Benjamini < .05,]
+
+down_rna_DAVID_GO <- read.table('CCLE_integrative/david_rna_only_analysis/david_rna_down_genes_GO_052020.txt', sep = '\t', header = T, stringsAsFactors = F)
+down_rna_DAVID_GO$term_filt <- sapply(down_rna_DAVID_GO$Term, function(x) strsplit(x, split = '\\~')[[1]][1])
+down_rna_DAVID_GO <- down_rna_DAVID_GO[down_rna_DAVID_GO$Benjamini < .05,]
+
+x <- up_rna_DAVID_GO$term_filt %in% rnaseq_orig_up_GO@result$ID
+y <- rnaseq_orig_up_GO@result$ID %in% up_rna_DAVID_GO$term_filt
+
+x_data <- up_rna_DAVID_GO[x,]
+y_data <- rnaseq_orig_up_GO@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+up_rna_GO_compare <- cbind(y_data[,c(1:3,10,6:7)], x_data[,c(3,5,12)])
+colnames(up_rna_GO_compare) <- c('Ontology', 'Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+up_rna_GO_compare <- up_rna_GO_compare %>% arrange(-DAVID_count)
+
+x <- down_rna_DAVID_GO$term_filt %in% rnaseq_orig_down_GO@result$ID
+y <- rnaseq_orig_down_GO@result$ID %in% down_rna_DAVID_GO$term_filt
+
+x_data <- down_rna_DAVID_GO[x,]
+y_data <- rnaseq_orig_down_GO@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+down_rna_GO_compare <- cbind(y_data[,c(1:3,10,6:7)], x_data[,c(3,5,12)])
+colnames(down_rna_GO_compare) <- c('Ontology', 'Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+down_rna_GO_compare <- down_rna_GO_compare %>% arrange(-DAVID_count)
+
+## KEGG
+up_rna_DAVID_KEGG <- read.table('CCLE_integrative/david_rna_only_analysis/david_rna_up_genes_kegg_reactome_052020.txt', sep = '\t', header = T, stringsAsFactors = F)
+up_rna_DAVID_KEGG <- up_rna_DAVID_KEGG %>% filter(Category == 'KEGG_PATHWAY')
+up_rna_DAVID_KEGG$term_filt <- sapply(up_rna_DAVID_KEGG$Term, function(x) strsplit(x, split = ':')[[1]][1])
+up_rna_DAVID_KEGG <- up_rna_DAVID_KEGG[up_rna_DAVID_KEGG$Benjamini < .05,]
+
+down_rna_DAVID_KEGG <- read.table('CCLE_integrative/david_rna_only_analysis/david_rna_down_genes_kegg_reactome_052020.txt', sep = '\t', header = T, stringsAsFactors = F)
+down_rna_DAVID_KEGG <- down_rna_DAVID_KEGG %>% filter(Category == 'KEGG_PATHWAY')
+down_rna_DAVID_KEGG$term_filt <- sapply(down_rna_DAVID_KEGG$Term, function(x) strsplit(x, split = ':')[[1]][1])
+down_rna_DAVID_KEGG <- down_rna_DAVID_KEGG[down_rna_DAVID_KEGG$Benjamini < .05,]
+
+x <- up_rna_DAVID_KEGG$term_filt %in% rnaseq_orig_up_KEGG@result$ID
+y <- rnaseq_orig_up_KEGG@result$ID %in% up_rna_DAVID_KEGG$term_filt
+
+x_data <- up_rna_DAVID_KEGG[x,]
+y_data <- rnaseq_orig_up_KEGG@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+up_rna_KEGG_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(up_rna_KEGG_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+up_rna_KEGG_compare <- up_rna_KEGG_compare %>% arrange(-DAVID_count)
+
+x <- down_rna_DAVID_KEGG$term_filt %in% rnaseq_orig_down_KEGG@result$ID
+y <- rnaseq_orig_down_KEGG@result$ID %in% down_rna_DAVID_KEGG$term_filt
+
+x_data <- down_rna_DAVID_KEGG[x,]
+y_data <- rnaseq_orig_down_KEGG@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+down_rna_KEGG_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(down_rna_KEGG_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+down_rna_KEGG_compare <- down_rna_KEGG_compare %>% arrange(-DAVID_count)
+
+## Reactome
+up_rna_DAVID_reactome <- read.table('CCLE_integrative/david_rna_only_analysis/david_rna_up_genes_kegg_reactome_052020.txt', sep = '\t', header = T, stringsAsFactors = F)
+up_rna_DAVID_reactome <- up_rna_DAVID_reactome %>% filter(Category == 'REACTOME_PATHWAY')
+up_rna_DAVID_reactome$term_filt <- sapply(up_rna_DAVID_reactome$Term, function(x) strsplit(x, split = ':')[[1]][1])
+up_rna_DAVID_reactome <- up_rna_DAVID_reactome[up_rna_DAVID_reactome$Benjamini < .05,]
+
+# no down reactome pathways
+# down_rna_DAVID_reactome <- read.table('CCLE_integrative/david_rna_only_analysis/david_rna_down_genes_kegg_reactome_052020.txt', sep = '\t', header = T, stringsAsFactors = F)
+# down_rna_DAVID_reactome <- down_rna_DAVID_reactome %>% filter(Category == 'REACTOME_PATHWAY')
+# down_rna_DAVID_reactome$term_filt <- sapply(down_rna_DAVID_reactome$Term, function(x) strsplit(x, split = ':')[[1]][1])
+# down_rna_DAVID_reactome <- down_rna_DAVID_reactome[down_rna_DAVID_reactome$Benjamini < .05,]
+
+x <- up_rna_DAVID_reactome$term_filt %in% rnaseq_orig_up_reactome@result$ID
+y <- rnaseq_orig_up_reactome@result$ID %in% up_rna_DAVID_reactome$term_filt
+
+x_data <- up_rna_DAVID_reactome[x,]
+y_data <- rnaseq_orig_up_reactome@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+up_rna_reactome_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(up_rna_reactome_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+up_rna_reactome_compare <- up_rna_reactome_compare %>% arrange(-DAVID_count)
+
+# no down reactome pathways
+# x <- down_rna_DAVID_reactome$term_filt %in% rnaseq_orig_down_reactome@result$ID
+# y <- rnaseq_orig_down_reactome@result$ID %in% down_rna_DAVID_reactome$term_filt
+# 
+# x_data <- down_rna_DAVID_reactome[x,]
+# y_data <- rnaseq_orig_down_reactome@result[y,]
+# y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+# 
+# down_rna_reactome_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+# colnames(down_rna_reactome_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+# down_rna_reactome_compare <- down_rna_reactome_compare %>% arrange(-DAVID_count)
+```
+
+### GSEA
+```{r}
+# MSigDB
+rnaseq_orig_gsea <- GSEA(rnaseq_orig_gene_list, TERM2GENE = msigdb_c2, pvalueCutoff = 1, nPerm = 10000)
+summary(rnaseq_orig_gsea@result)
+rnaseq_orig_gsea_sig <- rnaseq_orig_gsea@result %>% filter(p.adjust < .05)
+
+# GO
+rnaseq_orig_gseGO <- gseGO(rnaseq_orig_gene_list, ont = 'ALL', OrgDb = org.Hs.eg.db, nPerm = 10000, pvalueCutoff = 1)
+summary(rnaseq_orig_gseGO@result)
+rnaseq_orig_gseGO_sig <- rnaseq_orig_gseGO@result %>% filter(p.adjust < .05)
+
+# KEGG
+rnaseq_orig_gseKEGG <- gseKEGG(rnaseq_orig_gene_list, organism = 'human', nPerm = 10000, pvalueCutoff = 1)
+summary(rnaseq_orig_gseKEGG@result)
+rnaseq_orig_gseKEGG_sig <- rnaseq_orig_gseKEGG@result %>% filter(p.adjust < .05)
+
+
+# Reactome
+rnaseq_orig_gsereact <- gsePathway(rnaseq_orig_gene_list, organism = 'human', nPerm = 10000, pvalueCutoff = 1)
+summary(rnaseq_orig_gsereact@result)
+rnaseq_orig_gsereact_sig <- rnaseq_orig_gsereact@result %>% filter(p.adjust < .05) 
+```
+
+# Integrative Pathway Analysis
+Using integrative dataset of RNA-seq and RPPA FC.
+
+## Pathway Analysis
+
+## Setting up
+```{r}
+integrative_rpkm <- full_transform_rpkm$max_log_FC
+
+integrative_rpkm_names <- bitr(full_transform_rpkm$gene_name, fromType = 'SYMBOL', toType = 'ENTREZID', OrgDb = "org.Hs.eg.db", drop = F)
+dup_symbols <- integrative_rpkm_names$SYMBOL[duplicated(integrative_rpkm_names$SYMBOL)]
+dup_convert <- integrative_rpkm_names[integrative_rpkm_names$SYMBOL %in% dup_symbols,]
+integrative_rpkm_names <- integrative_rpkm_names[!duplicated(integrative_rpkm_names$SYMBOL),]
+
+names(integrative_rpkm) <- integrative_rpkm_names$ENTREZID
+integrative_rpkm <- integrative_rpkm[!is.na(names(integrative_rpkm))]
+integrative_rpkm <- sort(integrative_rpkm, decreasing = T)
+hist(integrative_rpkm)
+```
+
+```{r}
+integrative_tpm <- full_transform_tpm$max_log_FC
+
+integrative_tpm_names <- bitr(full_transform_tpm$gene_name, fromType = 'SYMBOL', toType = 'ENTREZID', OrgDb = "org.Hs.eg.db", drop = F)
+dup_symbols <- integrative_tpm_names$SYMBOL[duplicated(integrative_tpm_names$SYMBOL)]
+dup_convert <- integrative_tpm_names[integrative_tpm_names$SYMBOL %in% dup_symbols,]
+integrative_tpm_names <- integrative_tpm_names[!duplicated(integrative_tpm_names$SYMBOL),]
+
+names(integrative_tpm) <- integrative_tpm_names$ENTREZID
+integrative_tpm <- integrative_tpm[!is.na(names(integrative_tpm))]
+integrative_tpm <- sort(integrative_tpm, decreasing = T)
+hist(integrative_tpm)
+```
+
+
+## Functional Enrichment
+```{r}
+# gene list with abs(FC) > 2
+integrative_rpkm_filt <- integrative_rpkm[abs(integrative_rpkm) >= 2]
+
+# DAVID
+up_genes <- integrative_rpkm_filt[integrative_rpkm_filt > 0]
+down_genes <- integrative_rpkm_filt[integrative_rpkm_filt < 0]
+
+write.table(as.numeric(names(integrative_rpkm)), file = 'CCLE_integrative/david_integrative_analysis/background_rpkm_genes.txt', sep = '\n', row.names = F, col.names = F)
+write.table(as.numeric(names(up_genes)), file = 'CCLE_integrative/david_integrative_analysis/up_rpkm_genes.txt', sep = '\n', row.names = F, col.names = F)
+write.table(as.numeric(names(down_genes)), file = 'CCLE_integrative/david_integrative_analysis/down_rpkm_genes.txt', sep = '\n', row.names = F, col.names = F)
+
+# clusterProfiler
+## GO
+integrative_up_rpkm_GO <- enrichGO(names(up_genes), universe = names(integrative_rpkm), OrgDb = org.Hs.eg.db, ont = 'ALL', pvalueCutoff = 1, qvalueCutoff = 1)
+integrative_down_rpkm_GO <- enrichGO(names(down_genes), universe = names(integrative_rpkm), OrgDb = org.Hs.eg.db, ont = 'ALL', pvalueCutoff = 1, qvalueCutoff = 1)
+
+## KEGG
+integrative_up_rpkm_KEGG <- enrichKEGG(names(up_genes), universe = names(integrative_rpkm), organism = 'hsa', pvalueCutoff = 1, qvalueCutoff = 1)
+integrative_down_rpkm_KEGG <- enrichKEGG(names(down_genes), universe = names(integrative_rpkm), organism = 'hsa', pvalueCutoff = 1, qvalueCutoff = 1)
+
+## Reactome
+integrative_up_rpkm_reactome <- enrichPathway(names(up_genes), universe = names(integrative_rpkm), organism = 'human',pvalueCutoff = 1, qvalueCutoff = 1)
+integrative_down_rpkm_reactome <- enrichPathway(names(down_genes), universe = names(integrative_rpkm), organism = 'human', pvalueCutoff = 1, qvalueCutoff = 1)
+
+# ## MSigDB
+# integrative_up_rpkm_msigdb <- enricher(names(up_genes), universe = names(integrative_rpkm), TERM2GENE = msigdb_c2)
+# integrative_down_rpkm_msigdb <- enricher(names(down_genes), universe = names(integrative_rpkm), TERM2GENE = msigdb_c2)
+
+```
+
+```{r}
+# gene list with abs(FC) > 2
+integrative_tpm_filt <- integrative_tpm[abs(integrative_tpm) >= 2]
+
+# DAVID
+up_genes <- integrative_tpm_filt[integrative_tpm_filt > 0]
+down_genes <- integrative_tpm_filt[integrative_tpm_filt < 0]
+
+write.table(as.numeric(names(integrative_tpm)), file = 'CCLE_integrative/david_integrative_analysis/background_tpm_genes.txt', sep = '\n', row.names = F, col.names = F)
+write.table(as.numeric(names(up_genes)), file = 'CCLE_integrative/david_integrative_analysis/up_tpm_genes.txt', sep = '\n', row.names = F, col.names = F)
+write.table(as.numeric(names(down_genes)), file = 'CCLE_integrative/david_integrative_analysis/down_tpm_genes.txt', sep = '\n', row.names = F, col.names = F)
+
+# clusterProfiler
+## GO
+integrative_up_tpm_GO <- enrichGO(names(up_genes), universe = names(integrative_tpm), OrgDb = org.Hs.eg.db, ont = 'ALL', pvalueCutoff = 1, qvalueCutoff = 1)
+integrative_down_tpm_GO <- enrichGO(names(down_genes), universe = names(integrative_tpm), OrgDb = org.Hs.eg.db, ont = 'ALL', pvalueCutoff = 1, qvalueCutoff = 1)
+
+## KEGG
+integrative_up_tpm_KEGG <- enrichKEGG(names(up_genes), universe = names(integrative_tpm), organism = 'hsa', pvalueCutoff = 1, qvalueCutoff = 1)
+integrative_down_tpm_KEGG <- enrichKEGG(names(down_genes), universe = names(integrative_tpm), organism = 'hsa', pvalueCutoff = 1, qvalueCutoff = 1)
+
+## Reactome
+integrative_up_tpm_reactome <- enrichPathway(names(up_genes), universe = names(integrative_tpm), organism = 'human', pvalueCutoff = 1, qvalueCutoff = 1)
+integrative_down_tpm_reactome <- enrichPathway(names(down_genes), universe = names(integrative_tpm), organism = 'human', pvalueCutoff = 1, qvalueCutoff = 1)
+
+# ## MSigDB
+# integrative_up_tpm_msigdb <- enricher(names(up_genes), universe = names(integrative_tpm), TERM2GENE = msigdb_c2)
+# integrative_down_tpm_msigdb <- enricher(names(down_genes), universe = names(integrative_tpm), TERM2GENE = msigdb_c2)
+
+```
+
+### GSEA
+```{r}
+# Doing pvalue for integrative for now
+# MSigDB
+integrative_rpkm_gsea <- GSEA(integrative_rpkm, TERM2GENE = msigdb_c2, pvalueCutoff = 1, nPerm = 10000)
+summary(integrative_rpkm_gsea@result)
+integrative_rpkm_gsea_sig <- integrative_rpkm_gsea@result %>% filter(p.adjust < .05)
+
+# GO
+integrative_rpkm_gseGO <- gseGO(integrative_rpkm, ont = 'ALL', OrgDb = org.Hs.eg.db, nPerm = 10000, pvalueCutoff = 1)
+summary(integrative_rpkm_gseGO@result)
+integrative_rpkm_gseGO_sig <- integrative_rpkm_gseGO@result %>% filter(p.adjust < .05)
+
+# KEGG
+integrative_rpkm_gseKEGG <- gseKEGG(integrative_rpkm, organism = 'human', nPerm = 10000, pvalueCutoff = 1)
+summary(integrative_rpkm_gseKEGG@result)
+integrative_rpkm_gseKEGG_sig <- integrative_rpkm_gseKEGG@result %>% filter(pvalue < .05)
+
+# Reactome
+integrative_rpkm_gsereact <- gsePathway(integrative_rpkm, organism = 'human', nPerm = 10000, pvalueCutoff = 1)
+summary(integrative_rpkm_gsereact@result)
+integrative_rpkm_gsereact_sig <- integrative_rpkm_gsereact@result %>% filter(pvalue < .05) 
+
+```
+
+```{r}
+# MSigDB
+integrative_tpm_gsea <- GSEA(integrative_tpm, TERM2GENE = msigdb_c2, pvalueCutoff = 1, nPerm = 10000)
+summary(integrative_tpm_gsea@result)
+integrative_tpm_gsea_sig <- integrative_tpm_gsea@result %>% filter(p.adjust < .05)
+
+# GO
+integrative_tpm_gseGO <- gseGO(integrative_tpm, ont = 'ALL', OrgDb = org.Hs.eg.db, nPerm = 10000, pvalueCutoff = 1)
+summary(integrative_tpm_gseGO@result)
+integrative_tpm_gseGO_sig <- integrative_tpm_gseGO@result %>% filter(p.adjust < .05)
+
+# KEGG
+integrative_tpm_gseKEGG <- gseKEGG(integrative_tpm, organism = 'human', nPerm = 10000, pvalueCutoff = 1)
+summary(integrative_tpm_gseKEGG@result)
+integrative_tpm_gseKEGG_sig <- integrative_tpm_gseKEGG@result %>% filter(p.adjust < .05)
+
+# Reactome
+integrative_tpm_gsereact <- gsePathway(integrative_tpm, organism = 'human', nPerm = 10000, pvalueCutoff = 1)
+summary(integrative_tpm_gsereact@result)
+integrative_tpm_gsereact_sig <- integrative_tpm_gsereact@result %>% filter(p.adjust < .05) 
+
+```
+
+# Comparing RNA-only and Integrative 
+## Functional Enrichment
+### CP vs. DAVID
+```{r}
+# RPKM
+## GO
+int_rpkm_up_DAVID_GO <- read.table('CCLE_integrative/david_integrative_analysis/david_int_rpkm_up_genes_GO_052020.txt', sep = '\t', header = T, stringsAsFactors = F)
+int_rpkm_up_DAVID_GO$term_filt <- sapply(int_rpkm_up_DAVID_GO$Term, function(x) strsplit(x, split = '\\~')[[1]][1])
+int_rpkm_up_DAVID_GO <- int_rpkm_up_DAVID_GO[int_rpkm_up_DAVID_GO$Benjamini < .05,]
+
+int_rpkm_down_DAVID_GO <- read.table('CCLE_integrative/david_integrative_analysis/david_int_rpkm_down_genes_GO_052020.txt', sep = '\t', header = T, stringsAsFactors = F)
+int_rpkm_down_DAVID_GO$term_filt <- sapply(int_rpkm_down_DAVID_GO$Term, function(x) strsplit(x, split = '\\~')[[1]][1])
+int_rpkm_down_DAVID_GO <- int_rpkm_down_DAVID_GO[int_rpkm_down_DAVID_GO$Benjamini < .05,]
+
+x <- int_rpkm_up_DAVID_GO$term_filt %in% integrative_up_rpkm_GO@result$ID
+y <- integrative_up_rpkm_GO@result$ID %in% int_rpkm_up_DAVID_GO$term_filt
+
+x_data <- int_rpkm_up_DAVID_GO[x,]
+y_data <- integrative_up_rpkm_GO@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+int_rpkm_up_GO_compare <- cbind(y_data[,c(1:3,10,6:7)], x_data[,c(3,5,12)])
+colnames(int_rpkm_up_GO_compare) <- c('Ontology', 'Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+int_rpkm_up_GO_compare <- int_rpkm_up_GO_compare %>% arrange(-DAVID_count)
+
+x <- int_rpkm_down_DAVID_GO$term_filt %in% integrative_down_rpkm_GO@result$ID
+y <- integrative_down_rpkm_GO@result$ID %in% int_rpkm_down_DAVID_GO$term_filt
+
+x_data <- int_rpkm_down_DAVID_GO[x,]
+y_data <- integrative_down_rpkm_GO@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+int_rpkm_down_GO_compare <- cbind(y_data[,c(1:3,10,6:7)], x_data[,c(3,5,12)])
+colnames(int_rpkm_down_GO_compare) <- c('Ontology', 'Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+int_rpkm_down_GO_compare <- int_rpkm_down_GO_compare %>% arrange(-DAVID_count)
+
+## KEGG
+int_rpkm_up_DAVID_KEGG <- read.table('CCLE_integrative/david_integrative_analysis/david_int_rpkm_up_genes_kegg_reactome_052020.txt', sep = "\t", header = T, stringsAsFactors = F, )
+int_rpkm_up_DAVID_ <- int_rpkm_up_DAVID_KEGG %>% filter(Category == 'KEGG_PATHWAY')
+int_rpkm_up_DAVID_KEGG$term_filt <- sapply(int_rpkm_up_DAVID_KEGG$Term, function(x) strsplit(x, split = ':')[[1]][1])
+int_rpkm_up_DAVID_KEGG <- int_rpkm_up_DAVID_KEGG[int_rpkm_up_DAVID_KEGG$Benjamini < .05,]
+
+int_rpkm_down_DAVID_KEGG <- read.table('CCLE_integrative/david_integrative_analysis/david_int_rpkm_down_genes_kegg_reactome_052020.txt', sep = "\t", header = T, stringsAsFactors = F, )
+int_rpkm_down_DAVID_KEGG <- int_rpkm_down_DAVID_KEGG %>% filter(Category == 'KEGG_PATHWAY')
+int_rpkm_down_DAVID_KEGG$term_filt <- sapply(int_rpkm_down_DAVID_KEGG$Term, function(x) strsplit(x, split = ':')[[1]][1])
+int_rpkm_down_DAVID_KEGG <- int_rpkm_down_DAVID_KEGG[int_rpkm_down_DAVID_KEGG$Benjamini < .05,]
+
+x <- int_rpkm_up_DAVID_KEGG$term_filt %in% integrative_up_rpkm_KEGG@result$ID
+y <- integrative_up_rpkm_KEGG@result$ID %in% int_rpkm_up_DAVID_KEGG$term_filt
+
+x_data <- int_rpkm_up_DAVID_KEGG[x,]
+y_data <- integrative_up_rpkm_KEGG@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+int_rpkm_up_KEGG_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(int_rpkm_up_KEGG_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+int_rpkm_up_KEGG_compare <- int_rpkm_up_KEGG_compare %>% arrange(-DAVID_count)
+
+x <- int_rpkm_down_DAVID_KEGG$term_filt %in% integrative_down_rpkm_KEGG@result$ID
+y <- integrative_down_rpkm_KEGG@result$ID %in% int_rpkm_down_DAVID_KEGG$term_filt
+
+x_data <- int_rpkm_down_DAVID_KEGG[x,]
+y_data <- integrative_down_rpkm_KEGG@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+int_rpkm_down_KEGG_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(int_rpkm_down_KEGG_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+int_rpkm_down_KEGG_compare <- int_rpkm_down_KEGG_compare %>% arrange(-DAVID_count)
+
+## KEGG
+### had to get rid of any "'" in names for it to work
+int_rpkm_up_DAVID_KEGG <- read.table('CCLE_integrative/david_integrative_analysis/david_int_rpkm_up_genes_kegg_reactome_052020.txt', sep = "\t", header = T, stringsAsFactors = F, )
+int_rpkm_up_DAVID_KEGG <- int_rpkm_up_DAVID_KEGG %>% filter(Category == 'KEGG_PATHWAY')
+int_rpkm_up_DAVID_KEGG$term_filt <- sapply(int_rpkm_up_DAVID_KEGG$Term, function(x) strsplit(x, split = ':')[[1]][1])
+int_rpkm_up_DAVID_KEGG <- int_rpkm_up_DAVID_KEGG[int_rpkm_up_DAVID_KEGG$Benjamini < .05,]
+
+int_rpkm_down_DAVID_KEGG <- read.table('CCLE_integrative/david_integrative_analysis/david_int_rpkm_down_genes_kegg_reactome_052020.txt', sep = "\t", header = T, stringsAsFactors = F, )
+int_rpkm_down_DAVID_KEGG <- int_rpkm_down_DAVID_KEGG %>% filter(Category == 'KEGG_PATHWAY')
+int_rpkm_down_DAVID_KEGG$term_filt <- sapply(int_rpkm_down_DAVID_KEGG$Term, function(x) strsplit(x, split = ':')[[1]][1])
+int_rpkm_down_DAVID_KEGG <- int_rpkm_down_DAVID_KEGG[int_rpkm_down_DAVID_KEGG$Benjamini < .05,]
+
+x <- int_rpkm_up_DAVID_KEGG$term_filt %in% integrative_up_rpkm_KEGG@result$ID
+y <- integrative_up_rpkm_KEGG@result$ID %in% int_rpkm_up_DAVID_KEGG$term_filt
+
+x_data <- int_rpkm_up_DAVID_KEGG[x,]
+y_data <- integrative_up_rpkm_KEGG@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+int_rpkm_up_KEGG_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(int_rpkm_up_KEGG_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+int_rpkm_up_KEGG_compare <- int_rpkm_up_KEGG_compare %>% arrange(-DAVID_count)
+
+x <- int_rpkm_down_DAVID_KEGG$term_filt %in% integrative_down_rpkm_KEGG@result$ID
+y <- integrative_down_rpkm_KEGG@result$ID %in% int_rpkm_down_DAVID_KEGG$term_filt
+
+x_data <- int_rpkm_down_DAVID_KEGG[x,]
+y_data <- integrative_down_rpkm_KEGG@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+int_rpkm_down_KEGG_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(int_rpkm_down_KEGG_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+int_rpkm_down_KEGG_compare <- int_rpkm_down_KEGG_compare %>% arrange(-DAVID_count)
+
+## Reactome
+int_rpkm_up_DAVID_reactome <- read.table('CCLE_integrative/david_integrative_analysis/david_int_rpkm_up_genes_kegg_reactome_052020.txt', sep = '\t', header = T, stringsAsFactors = F)
+int_rpkm_up_DAVID_reactome <- int_rpkm_up_DAVID_reactome %>% filter(Category == 'REACTOME_PATHWAY')
+int_rpkm_up_DAVID_reactome$term_filt <- sapply(int_rpkm_up_DAVID_reactome$Term, function(x) strsplit(x, split = ':')[[1]][1])
+int_rpkm_up_DAVID_reactome <- int_rpkm_up_DAVID_reactome[int_rpkm_up_DAVID_reactome$Benjamini < .05,]
+
+int_rpkm_down_DAVID_reactome <- read.table('CCLE_integrative/david_integrative_analysis/david_int_rpkm_down_genes_kegg_reactome_052020.txt', sep = '\t', header = T, stringsAsFactors = F)
+int_rpkm_down_DAVID_reactome <- int_rpkm_down_DAVID_reactome %>% filter(Category == 'REACTOME_PATHWAY')
+int_rpkm_down_DAVID_reactome$term_filt <- sapply(int_rpkm_down_DAVID_reactome$Term, function(x) strsplit(x, split = ':')[[1]][1])
+int_rpkm_down_DAVID_reactome <- int_rpkm_down_DAVID_reactome[int_rpkm_down_DAVID_reactome$Benjamini < .05,]
+
+x <- int_rpkm_up_DAVID_reactome$term_filt %in% integrative_up_rpkm_reactome@result$ID
+y <- integrative_up_rpkm_reactome@result$ID %in% int_rpkm_up_DAVID_reactome$term_filt
+
+x_data <- int_rpkm_up_DAVID_reactome[x,]
+y_data <- integrative_up_rpkm_reactome@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+int_rpkm_up_reactome_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(int_rpkm_up_reactome_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+int_rpkm_up_reactome_compare <- int_rpkm_up_reactome_compare %>% arrange(-DAVID_count)
+
+x <- int_rpkm_down_DAVID_reactome$term_filt %in% integrative_down_rpkm_reactome@result$ID
+y <- integrative_down_rpkm_reactome@result$ID %in% int_rpkm_down_DAVID_reactome$term_filt
+
+x_data <- int_rpkm_down_DAVID_reactome[x,]
+y_data <- integrative_down_rpkm_reactome@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+int_rpkm_down_reactome_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(int_rpkm_down_reactome_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+int_rpkm_down_reactome_compare <- int_rpkm_down_reactome_compare %>% arrange(-DAVID_count)
+```
+
+```{r}
+# TPM
+## GO
+int_tpm_up_DAVID_GO <- read.table('CCLE_integrative/david_integrative_analysis/david_int_tpm_up_genes_GO_052020.txt', sep = '\t', header = T, stringsAsFactors = F)
+int_tpm_up_DAVID_GO$term_filt <- sapply(int_tpm_up_DAVID_GO$Term, function(x) strsplit(x, split = '\\~')[[1]][1])
+int_tpm_up_DAVID_GO <- int_tpm_up_DAVID_GO[int_tpm_up_DAVID_GO$Benjamini < .05,]
+
+int_tpm_down_DAVID_GO <- read.table('CCLE_integrative/david_integrative_analysis/david_int_tpm_down_genes_GO_052020.txt', sep = '\t', header = T, stringsAsFactors = F)
+int_tpm_down_DAVID_GO$term_filt <- sapply(int_tpm_down_DAVID_GO$Term, function(x) strsplit(x, split = '\\~')[[1]][1])
+int_tpm_down_DAVID_GO <- int_tpm_down_DAVID_GO[int_tpm_down_DAVID_GO$Benjamini < .05,]
+
+x <- int_tpm_up_DAVID_GO$term_filt %in% integrative_up_tpm_GO@result$ID
+y <- integrative_up_tpm_GO@result$ID %in% int_tpm_up_DAVID_GO$term_filt
+
+x_data <- int_tpm_up_DAVID_GO[x,]
+y_data <- integrative_up_tpm_GO@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+int_tpm_up_GO_compare <- cbind(y_data[,c(1:3,10,6:7)], x_data[,c(3,5,12)])
+colnames(int_tpm_up_GO_compare) <- c('Ontology', 'Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+int_tpm_up_GO_compare <- int_tpm_up_GO_compare %>% arrange(-DAVID_count)
+
+x <- int_tpm_down_DAVID_GO$term_filt %in% integrative_down_tpm_GO@result$ID
+y <- integrative_down_tpm_GO@result$ID %in% int_tpm_down_DAVID_GO$term_filt
+
+x_data <- int_tpm_down_DAVID_GO[x,]
+y_data <- integrative_down_tpm_GO@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+int_tpm_down_GO_compare <- cbind(y_data[,c(1:3,10,6:7)], x_data[,c(3,5,12)])
+colnames(int_tpm_down_GO_compare) <- c('Ontology', 'Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+int_tpm_down_GO_compare <- int_tpm_down_GO_compare %>% arrange(-DAVID_count)
+
+## KEGG
+### had to get rid of any "'" in names for it to work
+int_tpm_up_DAVID_KEGG <- read.table('CCLE_integrative/david_integrative_analysis/david_int_tpm_up_genes_kegg_reactome_052020.txt', sep = "\t", header = T, stringsAsFactors = F)
+int_tpm_up_DAVID_KEGG <- int_tpm_up_DAVID_KEGG %>% filter(Category == 'KEGG_PATHWAY')
+int_tpm_up_DAVID_KEGG$term_filt <- sapply(int_tpm_up_DAVID_KEGG$Term, function(x) strsplit(x, split = ':')[[1]][1])
+int_tpm_up_DAVID_KEGG <- int_tpm_up_DAVID_KEGG[int_tpm_up_DAVID_KEGG$Benjamini < .05,]
+
+int_tpm_down_DAVID_KEGG <- read.table('CCLE_integrative/david_integrative_analysis/david_int_tpm_down_genes_kegg_reactome_052020.txt', sep = "\t", header = T, stringsAsFactors = F, )
+int_tpm_down_DAVID_KEGG <- int_tpm_down_DAVID_KEGG %>% filter(Category == 'KEGG_PATHWAY')
+int_tpm_down_DAVID_KEGG$term_filt <- sapply(int_tpm_down_DAVID_KEGG$Term, function(x) strsplit(x, split = ':')[[1]][1])
+int_tpm_down_DAVID_KEGG <- int_tpm_down_DAVID_KEGG[int_tpm_down_DAVID_KEGG$Benjamini < .05,]
+
+x <- int_tpm_up_DAVID_KEGG$term_filt %in% integrative_up_tpm_KEGG@result$ID
+y <- integrative_up_tpm_KEGG@result$ID %in% int_tpm_up_DAVID_KEGG$term_filt
+
+x_data <- int_tpm_up_DAVID_KEGG[x,]
+y_data <- integrative_up_tpm_KEGG@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+int_tpm_up_KEGG_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(int_tpm_up_KEGG_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+int_tpm_up_KEGG_compare <- int_tpm_up_KEGG_compare %>% arrange(-DAVID_count)
+
+x <- int_tpm_down_DAVID_KEGG$term_filt %in% integrative_down_tpm_KEGG@result$ID
+y <- integrative_down_tpm_KEGG@result$ID %in% int_tpm_down_DAVID_KEGG$term_filt
+
+x_data <- int_tpm_down_DAVID_KEGG[x,]
+y_data <- integrative_down_tpm_KEGG@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+int_tpm_down_KEGG_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(int_tpm_down_KEGG_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+int_tpm_down_KEGG_compare <- int_tpm_down_KEGG_compare %>% arrange(-DAVID_count)
+
+## Reactome
+int_tpm_up_DAVID_reactome <- read.table('CCLE_integrative/david_integrative_analysis/david_int_tpm_up_genes_kegg_reactome_052020.txt', sep = '\t', header = T, stringsAsFactors = F)
+int_tpm_up_DAVID_reactome <- int_tpm_up_DAVID_reactome %>% filter(Category == 'REACTOME_PATHWAY')
+int_tpm_up_DAVID_reactome$term_filt <- sapply(int_tpm_up_DAVID_reactome$Term, function(x) strsplit(x, split = ':')[[1]][1])
+int_tpm_up_DAVID_reactome <- int_tpm_up_DAVID_reactome[int_tpm_up_DAVID_reactome$Benjamini < .05,]
+
+int_tpm_down_DAVID_reactome <- read.table('CCLE_integrative/david_integrative_analysis/david_int_tpm_down_genes_kegg_reactome_052020.txt', sep = '\t', header = T, stringsAsFactors = F)
+int_tpm_down_DAVID_reactome <- int_tpm_down_DAVID_reactome %>% filter(Category == 'REACTOME_PATHWAY')
+int_tpm_down_DAVID_reactome$term_filt <- sapply(int_tpm_down_DAVID_reactome$Term, function(x) strsplit(x, split = ':')[[1]][1])
+int_tpm_down_DAVID_reactome <- int_tpm_down_DAVID_reactome[int_tpm_down_DAVID_reactome$Benjamini < .05,]
+
+x <- int_tpm_up_DAVID_reactome$term_filt %in% integrative_up_tpm_reactome@result$ID
+y <- integrative_up_tpm_reactome@result$ID %in% int_tpm_up_DAVID_reactome$term_filt
+
+x_data <- int_tpm_up_DAVID_reactome[x,]
+y_data <- integrative_up_tpm_reactome@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+int_tpm_up_reactome_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(int_tpm_up_reactome_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+int_tpm_up_reactome_compare <- int_tpm_up_reactome_compare %>% arrange(-DAVID_count)
+
+x <- int_tpm_down_DAVID_reactome$term_filt %in% integrative_down_tpm_reactome@result$ID
+y <- integrative_down_tpm_reactome@result$ID %in% int_tpm_down_DAVID_reactome$term_filt
+
+x_data <- int_tpm_down_DAVID_reactome[x,]
+y_data <- integrative_down_tpm_reactome@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+int_tpm_down_reactome_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(int_tpm_down_reactome_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+int_tpm_down_reactome_compare <- int_tpm_down_reactome_compare %>% arrange(-DAVID_count)
+```
+
+### Counting RPPA genes
+```{r}
+# RPKM
+## functions
+count_genes_path_DAVID <- function(full_table, compare_table, rppa_genes) {
+  filt_table <- full_table %>% filter(term_filt %in% compare_table$Term)
+  
+  rppa_count <- c()
+  
+  for (current in filt_table$Genes) {
+    genes_list <- strsplit(current, ', ')[[1]]
+    count <- sum(rppa_genes %in% genes_list)
+    rppa_count <- c(rppa_count, count)
+  }
+  
+  compare_table <- cbind(compare_table, data.frame(rppa_count_DAVID = rppa_count))
+  
+  return(compare_table)
+}
+
+count_genes_path_CP <- function(full_table, compare_table, rppa_genes) {
+  filt_table <- full_table %>% filter(full_table$ID %in% compare_table$Term)
+  
+  rppa_count <- c()
+  
+  for (current in filt_table$geneID) {
+    genes_list <- strsplit(current, '/')[[1]]
+    count <- sum(rppa_genes %in% genes_list)
+    rppa_count <- c(rppa_count, count)
+  }
+  
+  compare_table <- cbind(compare_table, data.frame(rppa_count_CP = rppa_count))
+  
+  return(compare_table)
+}
+
+## up DAVID
+int_rpkm_up_GO_compare <- count_genes_path_DAVID(int_rpkm_up_DAVID_GO, int_rpkm_up_GO_compare, up_rppa_entrez)
+int_rpkm_up_GO_compare$rna_count_DAVID <- int_rpkm_up_GO_compare$DAVID_count - int_rpkm_up_GO_compare$rppa_count_DAVID
+
+int_rpkm_up_KEGG_compare <- count_genes_path_DAVID(int_rpkm_up_DAVID_KEGG, int_rpkm_up_KEGG_compare, up_rppa_entrez)
+int_rpkm_up_KEGG_compare$rna_count_DAVID <- int_rpkm_up_KEGG_compare$DAVID_count - int_rpkm_up_KEGG_compare$rppa_count_DAVID
+
+int_rpkm_up_reactome_compare <- count_genes_path_DAVID(int_rpkm_up_DAVID_reactome, int_rpkm_up_reactome_compare, up_rppa_entrez)
+int_rpkm_up_reactome_compare$rna_count_DAVID <- int_rpkm_up_reactome_compare$DAVID_count - int_rpkm_up_reactome_compare$rppa_count_DAVID
+
+## down DAVID
+int_rpkm_down_GO_compare <- count_genes_path_DAVID(int_rpkm_down_DAVID_GO, int_rpkm_down_GO_compare, down_rppa_entrez)
+int_rpkm_down_GO_compare$rna_count_DAVID <- int_rpkm_down_GO_compare$DAVID_count - int_rpkm_down_GO_compare$rppa_count_DAVID
+
+int_rpkm_down_KEGG_compare <- count_genes_path_DAVID(int_rpkm_down_DAVID_KEGG, int_rpkm_down_KEGG_compare, down_rppa_entrez)
+int_rpkm_down_KEGG_compare$rna_count_DAVID <- int_rpkm_down_KEGG_compare$DAVID_count - int_rpkm_down_KEGG_compare$rppa_count_DAVID
+
+int_rpkm_down_reactome_compare <- count_genes_path_DAVID(int_rpkm_down_DAVID_reactome, int_rpkm_down_reactome_compare, down_rppa_entrez)
+int_rpkm_down_reactome_compare$rna_count_DAVID <- int_rpkm_down_reactome_compare$DAVID_count - int_rpkm_down_reactome_compare$rppa_count_DAVID
+
+## up CP
+int_rpkm_up_GO_compare <- count_genes_path_CP(integrative_up_rpkm_GO@result, int_rpkm_up_GO_compare, up_rppa_entrez)
+int_rpkm_up_GO_compare$rna_count_CP <- int_rpkm_up_GO_compare$CP_count - int_rpkm_up_GO_compare$rppa_count_CP
+
+int_rpkm_up_KEGG_compare <- count_genes_path_CP(integrative_up_rpkm_KEGG@result, int_rpkm_up_KEGG_compare, up_rppa_entrez)
+int_rpkm_up_KEGG_compare$rna_count_CP <- int_rpkm_up_KEGG_compare$CP_count - int_rpkm_up_KEGG_compare$rppa_count_CP
+
+int_rpkm_up_reactome_compare <- count_genes_path_CP(integrative_up_rpkm_reactome@result, int_rpkm_up_reactome_compare, up_rppa_entrez)
+int_rpkm_up_reactome_compare$rna_count_CP <- int_rpkm_up_reactome_compare$CP_count - int_rpkm_up_reactome_compare$rppa_count_CP
+
+## down CP
+int_rpkm_down_GO_compare <- count_genes_path_CP(integrative_down_rpkm_GO@result, int_rpkm_down_GO_compare, down_rppa_entrez)
+int_rpkm_down_GO_compare$rna_count_CP <- int_rpkm_down_GO_compare$CP_count - int_rpkm_down_GO_compare$rppa_count_CP
+
+int_rpkm_down_KEGG_compare <- count_genes_path_CP(integrative_down_rpkm_KEGG@result, int_rpkm_down_KEGG_compare, down_rppa_entrez)
+int_rpkm_down_KEGG_compare$rna_count_CP <- int_rpkm_down_KEGG_compare$CP_count - int_rpkm_down_KEGG_compare$rppa_count_CP
+
+int_rpkm_down_reactome_compare <- count_genes_path_CP(integrative_down_rpkm_reactome@result, int_rpkm_down_reactome_compare, down_rppa_entrez)
+int_rpkm_down_reactome_compare$rna_count_CP <- int_rpkm_down_reactome_compare$CP_count - int_rpkm_down_reactome_compare$rppa_count_CP
+```
+
+```{r}
+# TPM
+## functions
+count_genes_path_DAVID <- function(full_table, compare_table, rppa_genes) {
+  filt_table <- full_table %>% filter(term_filt %in% compare_table$Term)
+  
+  rppa_count <- c()
+  
+  for (current in filt_table$Genes) {
+    genes_list <- strsplit(current, ', ')[[1]]
+    count <- sum(rppa_genes %in% genes_list)
+    rppa_count <- c(rppa_count, count)
+  }
+  
+  compare_table <- cbind(compare_table, data.frame(rppa_count_DAVID = rppa_count))
+  
+  return(compare_table)
+}
+
+count_genes_path_CP <- function(full_table, compare_table, rppa_genes) {
+  filt_table <- full_table %>% filter(full_table$ID %in% compare_table$Term)
+  
+  rppa_count <- c()
+  
+  for (current in filt_table$geneID) {
+    genes_list <- strsplit(current, '/')[[1]]
+    count <- sum(rppa_genes %in% genes_list)
+    rppa_count <- c(rppa_count, count)
+  }
+  
+  compare_table <- cbind(compare_table, data.frame(rppa_count_CP = rppa_count))
+  
+  return(compare_table)
+}
+
+## up DAVID
+int_tpm_up_GO_compare <- count_genes_path_DAVID(int_tpm_up_DAVID_GO, int_tpm_up_GO_compare, up_rppa_entrez)
+int_tpm_up_GO_compare$rna_count_DAVID <- int_tpm_up_GO_compare$DAVID_count - int_tpm_up_GO_compare$rppa_count_DAVID
+
+int_tpm_up_KEGG_compare <- count_genes_path_DAVID(int_tpm_up_DAVID_KEGG, int_tpm_up_KEGG_compare, up_rppa_entrez)
+int_tpm_up_KEGG_compare$rna_count_DAVID <- int_tpm_up_KEGG_compare$DAVID_count - int_tpm_up_KEGG_compare$rppa_count_DAVID
+
+int_tpm_up_reactome_compare <- count_genes_path_DAVID(int_tpm_up_DAVID_reactome, int_tpm_up_reactome_compare, up_rppa_entrez)
+int_tpm_up_reactome_compare$rna_count_DAVID <- int_tpm_up_reactome_compare$DAVID_count - int_tpm_up_reactome_compare$rppa_count_DAVID
+
+## down DAVID
+int_tpm_down_GO_compare <- count_genes_path_DAVID(int_tpm_down_DAVID_GO, int_tpm_down_GO_compare, down_rppa_entrez)
+int_tpm_down_GO_compare$rna_count_DAVID <- int_tpm_down_GO_compare$DAVID_count - int_tpm_down_GO_compare$rppa_count_DAVID
+
+int_tpm_down_KEGG_compare <- count_genes_path_DAVID(int_tpm_down_DAVID_KEGG, int_tpm_down_KEGG_compare, down_rppa_entrez)
+int_tpm_down_KEGG_compare$rna_count_DAVID <- int_tpm_down_KEGG_compare$DAVID_count - int_tpm_down_KEGG_compare$rppa_count_DAVID
+
+int_tpm_down_reactome_compare <- count_genes_path_DAVID(int_tpm_down_DAVID_reactome, int_tpm_down_reactome_compare, down_rppa_entrez)
+int_tpm_down_reactome_compare$rna_count_DAVID <- int_tpm_down_reactome_compare$DAVID_count - int_tpm_down_reactome_compare$rppa_count_DAVID
+
+## up CP
+int_tpm_up_GO_compare <- count_genes_path_CP(integrative_up_tpm_GO@result, int_tpm_up_GO_compare, up_rppa_entrez)
+int_tpm_up_GO_compare$rna_count_CP <- int_tpm_up_GO_compare$CP_count - int_tpm_up_GO_compare$rppa_count_CP
+
+int_tpm_up_KEGG_compare <- count_genes_path_CP(integrative_up_tpm_KEGG@result, int_tpm_up_KEGG_compare, up_rppa_entrez)
+int_tpm_up_KEGG_compare$rna_count_CP <- int_tpm_up_KEGG_compare$CP_count - int_tpm_up_KEGG_compare$rppa_count_CP
+
+int_tpm_up_reactome_compare <- count_genes_path_CP(integrative_up_tpm_reactome@result, int_tpm_up_reactome_compare, up_rppa_entrez)
+int_tpm_up_reactome_compare$rna_count_CP <- int_tpm_up_reactome_compare$CP_count - int_tpm_up_reactome_compare$rppa_count_CP
+
+## down CP
+int_tpm_down_GO_compare <- count_genes_path_CP(integrative_down_tpm_GO@result, int_tpm_down_GO_compare, down_rppa_entrez)
+int_tpm_down_GO_compare$rna_count_CP <- int_tpm_down_GO_compare$CP_count - int_tpm_down_GO_compare$rppa_count_CP
+
+int_tpm_down_KEGG_compare <- count_genes_path_CP(integrative_down_tpm_KEGG@result, int_tpm_down_KEGG_compare, down_rppa_entrez)
+int_tpm_down_KEGG_compare$rna_count_CP <- int_tpm_down_KEGG_compare$CP_count - int_tpm_down_KEGG_compare$rppa_count_CP
+
+int_tpm_down_reactome_compare <- count_genes_path_CP(integrative_down_tpm_reactome@result, int_tpm_down_reactome_compare, down_rppa_entrez)
+int_tpm_down_reactome_compare$rna_count_CP <- int_tpm_down_reactome_compare$CP_count - int_tpm_down_reactome_compare$rppa_count_CP
+```
+
+### Integrative vs. RNA-only 
+```{r}
+# up
+## GO
+x <- integrative_up_rpkm_GO@result %>% filter(p.adjust < .05)
+y <- integrative_up_tpm_GO@result %>% filter(p.adjust < .05)
+z <- rnaseq_orig_up_GO@result %>% filter(p.adjust < .05)
+xd <- int_rpkm_up_DAVID_GO %>% filter(Benjamini < .05)
+yd <- int_tpm_up_DAVID_GO %>% filter(Benjamini < .05)
+
+integrative_common_path_CP_GO <- intersect(x$ID, y$ID)
+common_path_CP_GO <- intersect(integrative_common_path_CP_GO, z$ID)
+rpkm_common_path_CP_GO <- intersect(x$ID, z$ID)
+tpm_common_path_CP_GO <- intersect(y$ID, z$ID)
+
+common_up_path_CP_GO_data <- data.frame(ID = common_path_CP_GO)
+a <- z %>% filter(ID %in% common_path_CP_GO) %>% arrange(match(ID, common_path_CP_GO)) %>% select(ID, Description, Count, pvalue, p.adjust) %>% rename(path = Description, rna_count = Count, rna_pvalue = pvalue, rna_p.adjust = p.adjust)
+common_up_path_CP_GO_data <- cbind(common_up_path_CP_GO_data, a[,-1])
+a <- x %>% filter(ID %in% common_path_CP_GO) %>% arrange(match(ID, common_path)) %>% select(ID, Description, Count, pvalue, p.adjust) %>% rename(int_rpkm_count = Count, int_rpkm_pvalue = pvalue, int_rpkm_p.adjust = p.adjust)
+common_up_path_CP_GO_data <- cbind(common_up_path_CP_GO_data, a[,-c(1:2)])
+a <- y %>% filter(ID %in% common_path_CP_GO) %>% arrange(match(ID, common_path)) %>% select(ID, Description, Count, pvalue, p.adjust) %>% rename(int_tpm_count = Count, int_tpm_pvalue = pvalue, int_tpm_p.adjust = p.adjust)
+common_up_path_CP_GO_data <- cbind(common_up_path_CP_GO_data, a[,-c(1:2)])
+common_up_path_CP_GO_data <- common_up_path_CP_GO_data %>% arrange(-rna_count)
+common_up_path_CP_GO_data$path <- factor(common_up_path_CP_GO_data$path, rev(as.character(common_up_path_CP_GO_data$path))) 
+
+integrative_common_path_DAVID_GO <- intersect(xd$term_filt, yd$term_filt)
+common_path_DAVID_GO <- intersect(integrative_common_path_DAVID_GO, z$ID)
+rpkm_common_path_DAVID_GO <- intersect(xd$term_filt, z$ID)
+tpm_common_path_DAVID_GO <- intersect(yd$term_filt, z$ID)
+
+
+
+
+
+
+
+
+x <- integrative_down_rpkm_GO@result %>% filter(p.adjust < .05)
+y <- integrative_down_tpm_GO@result %>% filter(p.adjust < .05)
+z <- rnaseq_orig_down_GO@result %>% filter(p.adjust < .05)
+integrative_common_path_GO <- intersect(x$ID, y$ID)
+# no common paths
+common_path_GO <- intersect(integrative_common_path_GO, z$ID)
+rpkm_common_path_GO <- intersect(x$ID, z$ID)
+tpm_common_path_GO <- intersect(y$ID, z$ID)
+
+
+
+
+```
+
+```{r}
+
+```
+
+
+### Top Individual pathways
+```{r}
+# CP integrative RPKM up
+integrative_up_rpkm_GO@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+integrative_up_rpkm_KEGG@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+integrative_up_rpkm_reactome@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+# CP integrative TPM up
+integrative_up_tpm_GO@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+integrative_up_tpm_KEGG@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+integrative_up_tpm_reactome@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+# CP integrative RPKM down
+integrative_down_rpkm_GO@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+integrative_down_rpkm_KEGG@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+integrative_down_rpkm_reactome@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+# CP integrative TPM down
+integrative_up_tpm_GO@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+integrative_up_tpm_KEGG@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+integrative_up_tpm_reactome@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+```
+
+```{r}
+# DAVID integrative RPKM up
+int_rpkm_up_DAVID_GO %>% filter(Benjamini < .05) %>% top_n(20, wt = -Benjamini) %>% ggplot(aes(Count, reorder(Term, -Benjamini), fill = -log10(Benjamini))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+int_rpkm_up_DAVID_KEGG %>% filter(Benjamini < .05) %>% top_n(20, wt = -Benjamini) %>% ggplot(aes(Count, reorder(Term, -Benjamini), fill = -log10(Benjamini))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+int_rpkm_up_DAVID_reactome %>% filter(Benjamini < .05) %>% top_n(20, wt = -Benjamini) %>% ggplot(aes(Count, reorder(term_filt, -Benjamini), fill = -log10(Benjamini))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+# DAVID integrative TPM up
+int_tpm_up_DAVID_GO %>% filter(Benjamini < .05) %>% top_n(20, wt = -Benjamini) %>% ggplot(aes(Count, reorder(Term, -Benjamini), fill = -log10(Benjamini))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+int_tpm_up_DAVID_KEGG %>% filter(Benjamini < .05) %>% top_n(20, wt = -Benjamini) %>% ggplot(aes(Count, reorder(Term, -Benjamini), fill = -log10(Benjamini))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+int_tpm_up_DAVID_reactome %>% filter(Benjamini < .05) %>% top_n(20, wt = -Benjamini) %>% ggplot(aes(Count, reorder(Term, -Benjamini), fill = -log10(Benjamini))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+# DAVID integrative RPKM down
+int_rpkm_down_DAVID_GO %>% filter(Benjamini < .05) %>% top_n(20, wt = -Benjamini) %>% ggplot(aes(Count, reorder(Term, -Benjamini), fill = -log10(Benjamini))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+int_rpkm_down_DAVID_KEGG %>% filter(Benjamini < .05) %>% top_n(20, wt = -Benjamini) %>% ggplot(aes(Count, reorder(Term, -Benjamini), fill = -log10(Benjamini))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+int_rpkm_down_DAVID_reactome %>% filter(Benjamini < .05) %>% top_n(20, wt = -Benjamini) %>% ggplot(aes(Count, reorder(term_filt, -Benjamini), fill = -log10(Benjamini))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+# DAVID integrative TPM down
+int_tpm_down_DAVID_GO %>% filter(Benjamini < .05) %>% top_n(20, wt = -Benjamini) %>% ggplot(aes(Count, reorder(Term, -Benjamini), fill = -log10(Benjamini))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+int_tpm_down_DAVID_KEGG %>% filter(Benjamini < .05) %>% top_n(20, wt = -Benjamini) %>% ggplot(aes(Count, reorder(Term, -Benjamini), fill = -log10(Benjamini))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+int_tpm_down_DAVID_reactome %>% filter(Benjamini < .05) %>% top_n(20, wt = -Benjamini) %>% ggplot(aes(Count, reorder(term_filt, -Benjamini), fill = -log10(Benjamini))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+```
+
+```{r}
+# CP RNA-only up
+rnaseq_orig_up_GO@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+rnaseq_orig_up_KEGG@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+rnaseq_orig_up_reactome@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+# CP RNA-only down
+rnaseq_orig_up_GO@result %>% filter(p.adjust < .05) %>% top_n(20, wt = -p.adjust) %>% ggplot(aes(Count, reorder(Description, -p.adjust), fill = -log10(p.adjust))) + geom_bar(stat = 'identity') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+```
+
+
+
+### Top 20 compared pathways (CP vs. DAVID)
+```{r}
+# RPKM
+## top 20 compared pathways
+int_rpkm_up_GO_compare %>% top_n(20, wt = DAVID_count) %>% dplyr::select(Description, CP_count, DAVID_count) %>% reshape::melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+int_rpkm_down_GO_compare %>% top_n(20, wt = DAVID_count) %>% dplyr::select(Description, CP_count, DAVID_count) %>% reshape::melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+# 7 pathways
+int_rpkm_up_KEGG_compare %>% top_n(7, wt = DAVID_count) %>% dplyr::select(Description, CP_count, DAVID_count) %>% reshape::melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+int_rpkm_down_KEGG_compare %>% top_n(20, wt = DAVID_count) %>% dplyr::select(Description, CP_count, DAVID_count) %>% reshape::melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+int_rpkm_up_reactome_compare %>% top_n(20, wt = DAVID_count) %>% dplyr::select(Description, CP_count, DAVID_count) %>% reshape::melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+int_rpkm_down_reactome_compare %>% top_n(20, wt = DAVID_count) %>% dplyr::select(Description, CP_count, DAVID_count) %>% reshape::melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+## rppa gene content plots (maybe change so it's percentage)
+int_rpkm_up_GO_compare %>% top_n(10, wt = rppa_count_CP) %>% dplyr::select(Description, rppa_count_CP, rna_count_CP) %>% reshape::melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+down_GO_compare %>% top_n(10, wt = rppa_count_CP) %>% dplyr::select(Description, rppa_count_CP, rna_count_CP) %>% melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+up_KEGG_compare %>% top_n(10, wt = rppa_count_CP) %>% dplyr::select(Description, rppa_count_CP, rna_count_CP) %>% melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+down_KEGG_compare %>% top_n(10, wt = rppa_count_CP) %>% dplyr::select(Description, rppa_count_CP, rna_count_CP) %>% melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+```
+
+```{r}
+
+```
+
+### Top compared pathways (RNA-only vs. Integrative)
+```{r}
+common_up_path_CP_GO_data %>% select(path, )
+
+common_up_path__data %>% select(path, rna_NES, int_rpkm_NES, int_tpm_NES, sign_agree) %>% reshape::melt(c('path','sign_agree')) %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15)) + facet_grid(.~sign_agree)
+
+```
+
+```{r}
+
+
+```
+
+### Top Integrative vs. RNA-only
+```{r}
+# RPKM up GO
+x <- integrative_up_rpkm_GO@result %>% filter(p.adjust < .05) %>% top_n(20, -p.adjust) %>% select(ID, Description, p.adjust, Count) %>% rename(path = Description, int_rpkm_padjust = p.adjust, int_rpkm_count = Count)
+x <- cbind(x, integrative_up_tpm_GO@result %>% filter(ID %in% x$ID) %>% arrange(match(ID, x$ID)) %>% select(p.adjust, Count) %>% rename(int_tpm_padjust = p.adjust, int_tpm_count = Count))
+x <- cbind(x, rnaseq_orig_up_GO@result %>% filter(ID %in% x$ID) %>% arrange(match(ID, x$ID)) %>% select(p.adjust, Count) %>% rename(rna_padjust = p.adjust, rna_count = Count))
+a <- x$path
+
+x <- reshape(x, direction = 'long', varying = c("int_rpkm_padjust","int_rpkm_count", "int_tpm_padjust", "int_tpm_count", "rna_padjust", "rna_count"), timevar = 'var', times = c('int_rpkm', 'int_tpm', 'rna'), v.names = c('padjust', 'count'), idvar = 'sbj', split = '_') %>% rename(count = padjust, padjust = count)
+x$path <- factor(x$path, levels = rev(as.character(a)))
+
+x %>% ggplot(aes(count, reorder(path, padjust), fill = var, group = var)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+# RPKM up KEGG
+x <- integrative_up_rpkm_KEGG@result %>% filter(p.adjust < .05) %>% top_n(20, -p.adjust) %>% select(ID, Description, p.adjust, Count) %>% rename(path = Description, int_rpkm_padjust = p.adjust, int_rpkm_count = Count)
+x <- cbind(x, integrative_up_tpm_KEGG@result %>% filter(ID %in% x$ID) %>% arrange(match(ID, x$ID)) %>% select(p.adjust, Count) %>% rename(int_tpm_padjust = p.adjust, int_tpm_count = Count))
+x <- x[-c(1,3,6,9,10,12,13),]
+x <- cbind(x, rnaseq_orig_up_KEGG@result %>% filter(ID %in% x$ID) %>% arrange(match(ID, x$ID)) %>% select(p.adjust, Count) %>% rename(rna_padjust = p.adjust, rna_count = Count))
+a <- x$path
+
+x <- reshape(x, direction = 'long', varying = c("int_rpkm_padjust","int_rpkm_count", "int_tpm_padjust", "int_tpm_count", "rna_padjust", "rna_count"), timevar = 'var', times = c('int_rpkm', 'int_tpm', 'rna'), v.names = c('padjust', 'count'), idvar = 'sbj', split = '_') %>% rename(count = padjust, padjust = count)
+x$path <- factor(x$path, levels = rev(as.character(a)))
+
+x %>% ggplot(aes(count, reorder(path, padjust), fill = var, group = var)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('Gene Count') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+```
+
+
+## GSEA
+```{r}
+# In common pathways
+## MSigDB
+integrative_common_path_gsea <- intersect(integrative_rpkm_gsea_sig$Description, integrative_tpm_gsea_sig$Description)
+common_path_gsea <- intersect(rnaseq_orig_gsea_sig$Description, integrative_common_path)
+rpkm_common_path_gsea <- intersect(rnaseq_orig_gsea_sig$Description, integrative_rpkm_gsea_sig$Description)
+tpm_common_path_gsea <- intersect(rnaseq_orig_gsea_sig$Description, integrative_tpm_gsea_sig$Description)
+
+common_path_gsea_data <- data.frame(path = common_path_gsea)
+x <- rnaseq_orig_gsea_sig %>% filter(Description %in% common_path) %>% arrange(match(Description, common_path)) %>% select(Description, NES, pvalue, p.adjust) %>% rename(rna_NES = NES, rna_pvalue = pvalue, rna_p.adjust = p.adjust)
+common_path_gsea_data <- cbind(common_path_gsea_data, x[,-1])
+x <- integrative_rpkm_gsea_sig %>% filter(Description %in% common_path) %>% arrange(match(Description, common_path)) %>% select(Description, NES, pvalue, p.adjust) %>% rename(int_rpkm_NES = NES, int_rpkm_pvalue = pvalue, int_rpkm_p.adjust = p.adjust)
+common_path_gsea_data <- cbind(common_path_gsea_data, x[,-1])
+x <- integrative_tpm_gsea_sig %>% filter(Description %in% common_path) %>% arrange(match(Description, common_path)) %>% select(Description, NES, pvalue, p.adjust) %>% rename(int_tpm_NES = NES, int_tpm_pvalue = pvalue, int_tpm_p.adjust = p.adjust)
+common_path_gsea_data <- cbind(common_path_gsea_data, x[,-1])
+common_path_gsea_data <- common_path_gsea_data %>% mutate(sign_agree = factor(ifelse(sign(rna_NES) == sign(int_rpkm_NES), 'same', 'different'))) %>% arrange(desc(sign_agree), int_tpm_NES) 
+common_path_gsea_data$path <- factor(common_path_gsea_data$path, rev(as.character(common_path_gsea_data$path)))
+common_path_gsea_data$sign_agree <- factor(common_path_gsea_data$sign_agree, rev(levels(common_path_gsea_data$sign_agree)))
+
+
+## GO
+integrative_common_path_gseGO <- intersect(integrative_rpkm_gseGO_sig$ID, integrative_tpm_gseGO_sig$ID)
+common_path_gseGO <- intersect(rnaseq_orig_gseGO_sig$ID, integrative_common_path_gseGO)
+rpkm_common_path_gseGO <- intersect(rnaseq_orig_gseGO_sig$ID, integrative_rpkm_gseGO_sig$ID)
+tpm_common_path_gseGO <- intersect(rnaseq_orig_gseGO_sig$ID, integrative_tpm_gseGO_sig$ID)
+
+common_path_gseGO_data <- data.frame(path = common_path_gseGO)
+x <- rnaseq_orig_gseGO_sig %>% filter(ID %in% common_path_gseGO) %>% arrange(match(ID, common_path)) %>% select(ID, Description, NES, pvalue, p.adjust) %>% rename(rna_NES = NES, rna_pvalue = pvalue, rna_p.adjust = p.adjust)
+common_path_gseGO_data <- cbind(common_path_gseGO_data, x[,-1])
+x <- integrative_rpkm_gseGO_sig %>% filter(ID %in% common_path_gseGO) %>% arrange(match(ID, common_path)) %>% select(ID, NES, pvalue, p.adjust) %>% rename(int_rpkm_NES = NES, int_rpkm_pvalue = pvalue, int_rpkm_p.adjust = p.adjust)
+common_path_gseGO_data <- cbind(common_path_gseGO_data, x[,-1])
+x <- integrative_tpm_gseGO_sig %>% filter(ID %in% common_path_gseGO) %>% arrange(match(ID, common_path)) %>% select(ID, NES, pvalue, p.adjust) %>% rename(int_tpm_NES = NES, int_tpm_pvalue = pvalue, int_tpm_p.adjust = p.adjust)
+common_path_gseGO_data <- cbind(common_path_gseGO_data, x[,-1])
+common_path_gseGO_data <- common_path_gseGO_data %>% mutate(sign_agree = factor(ifelse(sign(rna_NES) == sign(int_rpkm_NES), 'same', 'different'))) %>% arrange(desc(sign_agree), int_tpm_NES) 
+common_path_gseGO_data$Description <- factor(common_path_gseGO_data$Description, rev(as.character(common_path_gseGO_data$Description)))
+common_path_gseGO_data$sign_agree <- factor(common_path_gseGO_data$sign_agree, rev(levels(common_path_gseGO_data$sign_agree)))
+
+## KEGG
+integrative_common_path_gseKEGG <- intersect(integrative_rpkm_gseKEGG_sig$ID, integrative_tpm_gseKEGG_sig$ID)
+common_path_gseKEGG <- intersect(rnaseq_orig_gseKEGG_sig$ID, integrative_common_path_gseKEGG)
+rpkm_common_path_gseKEGG <- intersect(rnaseq_orig_gseKEGG_sig$ID, integrative_rpkm_gseKEGG_sig$ID)
+tpm_common_path_gseKEGG <- intersect(rnaseq_orig_gseKEGG_sig$ID, integrative_tpm_gseKEGG_sig$ID)
+
+common_path_gseKEGG_data <- data.frame(path = common_path_gseKEGG)
+x <- rnaseq_orig_gseKEGG_sig %>% filter(ID %in% common_path_gseKEGG) %>% arrange(match(ID, common_path)) %>% select(ID, Description, NES, pvalue, p.adjust) %>% rename(rna_NES = NES, rna_pvalue = pvalue, rna_p.adjust = p.adjust)
+common_path_gseKEGG_data <- cbind(common_path_gseKEGG_data, x[,-1])
+x <- integrative_rpkm_gseKEGG_sig %>% filter(ID %in% common_path_gseKEGG) %>% arrange(match(ID, common_path)) %>% select(ID, NES, pvalue, p.adjust) %>% rename(int_rpkm_NES = NES, int_rpkm_pvalue = pvalue, int_rpkm_p.adjust = p.adjust)
+common_path_gseKEGG_data <- cbind(common_path_gseKEGG_data, x[,-1])
+x <- integrative_tpm_gseKEGG_sig %>% filter(ID %in% common_path_gseKEGG) %>% arrange(match(ID, common_path)) %>% select(ID, NES, pvalue, p.adjust) %>% rename(int_tpm_NES = NES, int_tpm_pvalue = pvalue, int_tpm_p.adjust = p.adjust)
+common_path_gseKEGG_data <- cbind(common_path_gseKEGG_data, x[,-1])
+common_path_gseKEGG_data <- common_path_gseKEGG_data %>% mutate(sign_agree = factor(ifelse(sign(rna_NES) == sign(int_rpkm_NES), 'same', 'different'))) %>% arrange(desc(sign_agree), int_tpm_NES) 
+common_path_gseKEGG_data$Description <- factor(common_path_gseKEGG_data$Description, rev(as.character(common_path_gseKEGG_data$Description)))
+common_path_gseKEGG_data$sign_agree <- factor(common_path_gseKEGG_data$sign_agree, rev(levels(common_path_gseKEGG_data$sign_agree)))
+
+## Reactome
+integrative_common_path_gsereact <- intersect(integrative_rpkm_gsereact_sig$ID, integrative_tpm_gsereact_sig$ID)
+common_path_gsereact <- intersect(rnaseq_orig_gsereact_sig$ID, integrative_common_path_gsereact)
+rpkm_common_path_gsereact <- intersect(rnaseq_orig_gsereact_sig$ID, integrative_rpkm_gsereact_sig$ID)
+tpm_common_path_gsereact <- intersect(rnaseq_orig_gsereact_sig$ID, integrative_tpm_gsereact_sig$ID)
+
+common_path_gsereact_data <- data.frame(path = common_path_gsereact)
+x <- rnaseq_orig_gsereact_sig %>% filter(ID %in% common_path_gsereact) %>% arrange(match(ID, common_path)) %>% select(ID, Description, NES, pvalue, p.adjust) %>% rename(rna_NES = NES, rna_pvalue = pvalue, rna_p.adjust = p.adjust)
+common_path_gsereact_data <- cbind(common_path_gsereact_data, x[,-1])
+x <- integrative_rpkm_gsereact_sig %>% filter(ID %in% common_path_gsereact) %>% arrange(match(ID, common_path)) %>% select(ID, NES, pvalue, p.adjust) %>% rename(int_rpkm_NES = NES, int_rpkm_pvalue = pvalue, int_rpkm_p.adjust = p.adjust)
+common_path_gsereact_data <- cbind(common_path_gsereact_data, x[,-1])
+x <- integrative_tpm_gsereact_sig %>% filter(ID %in% common_path_gsereact) %>% arrange(match(ID, common_path)) %>% select(ID, NES, pvalue, p.adjust) %>% rename(int_tpm_NES = NES, int_tpm_pvalue = pvalue, int_tpm_p.adjust = p.adjust)
+common_path_gsereact_data <- cbind(common_path_gsereact_data, x[,-1])
+common_path_gsereact_data <- common_path_gsereact_data %>% mutate(sign_agree = factor(ifelse(sign(rna_NES) == sign(int_rpkm_NES), 'same', 'different'))) %>% arrange(desc(sign_agree), int_tpm_NES) 
+common_path_gsereact_data$Description <- factor(common_path_gsereact_data$Description, rev(as.character(common_path_gsereact_data$Description)))
+common_path_gsereact_data$sign_agree <- factor(common_path_gsereact_data$sign_agree, rev(levels(common_path_gsereact_data$sign_agree)))
+```
+
+```{r}
+# common pathways bar plots
+common_path_gsea_data %>% select(path, rna_NES, int_rpkm_NES, int_tpm_NES, sign_agree) %>% reshape::melt(c('path','sign_agree')) %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15)) + facet_grid(.~sign_agree)
+
+common_path_gseGO_data %>% select(Description, rna_NES, int_rpkm_NES, int_tpm_NES, sign_agree) %>% reshape::melt(c('Description','sign_agree')) %>% ggplot(aes(value, Description, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15)) + facet_grid(.~sign_agree)
+
+common_path_gseKEGG_data %>% select(Description, rna_NES, int_rpkm_NES, int_tpm_NES, sign_agree) %>% reshape::melt(c('Description','sign_agree')) %>% ggplot(aes(value, Description, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15)) + facet_grid(.~sign_agree)
+
+common_path_gsereact_data %>% select(Description, rna_NES, int_rpkm_NES, int_tpm_NES, sign_agree) %>% reshape::melt(c('Description','sign_agree')) %>% ggplot(aes(value, Description, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15)) + facet_grid(.~sign_agree)
+```
+
+```{r}
+# find rppa affected pathways
+count_genes_path_CP_single <- function(path_table, rppa_genes) {
+  rppa_count <- c()
+  
+  for (current in path_table$core_enrichment) {
+    genes_list <- strsplit(current, '/')[[1]]
+    count <- sum(names(rppa_genes) %in% genes_list)
+    rppa_count <- c(rppa_count, count)
+  }
+  
+  names(rppa_count) <- path_table$Description
+  rppa_count <- sort(rppa_count, decreasing = T)
+  
+  return(rppa_count)
+}
+
+## rpkm
+integrate_rpkm_rppa_genes <- integrate_transform_rpkm %>% filter(max_RPPAorRNA == 'RPPA') %>% select(gene_name) %>% unlist
+x <- integrative_rpkm_names[integrative_rpkm_names$SYMBOL %in% integrate_rpkm_rppa_genes,]
+names(integrate_rpkm_rppa_genes) <- x$ENTREZID[match(x$SYMBOL, integrate_rpkm_rppa_genes)]
+
+### msigdb 
+int_rpkm_gsea_rppa <- count_genes_path_CP_single(integrative_rpkm_gsea_sig, integrate_rpkm_rppa_genes)
+int_rpkm_gsea_rppa <- int_rpkm_gsea_rppa[int_rpkm_gsea_rppa > 0]
+
+### GO
+int_rpkm_gseGO_rppa <- count_genes_path_CP_single(integrative_rpkm_gseGO_sig, integrate_rpkm_rppa_genes)
+int_rpkm_gseGO_rppa <- int_rpkm_gseGO_rppa[int_rpkm_gseGO_rppa > 0]
+
+### KEGG
+int_rpkm_gseKEGG_rppa <- count_genes_path_CP_single(integrative_rpkm_gseKEGG_sig, integrate_rpkm_rppa_genes)
+int_rpkm_gseKEGG_rppa <- int_rpkm_gseKEGG_rppa[int_rpkm_gseKEGG_rppa > 0]
+
+### Reactome
+int_rpkm_gsereact_rppa <- count_genes_path_CP_single(integrative_rpkm_gsereact_sig, integrate_rpkm_rppa_genes)
+int_rpkm_gsereact_rppa <- int_rpkm_gsereact_rppa[int_rpkm_gsereact_rppa > 0]
+
+## tpm
+integrate_tpm_rppa_genes <- integrate_transform_tpm %>% filter(max_RPPAorRNA == 'RPPA') %>% select(gene_name) %>% unlist
+x <- integrative_tpm_names[integrative_tpm_names$SYMBOL %in% integrate_tpm_rppa_genes,]
+names(integrate_tpm_rppa_genes) <- x$ENTREZID[match(x$SYMBOL, integrate_tpm_rppa_genes)]
+
+### msigdb 
+int_tpm_gsea_rppa <- count_genes_path_CP_single(integrative_tpm_gsea_sig, integrate_tpm_rppa_genes)
+int_tpm_gsea_rppa <- int_tpm_gsea_rppa[int_tpm_gsea_rppa > 0]
+
+### GO
+int_tpm_gseGO_rppa <- count_genes_path_CP_single(integrative_tpm_gseGO_sig, integrate_tpm_rppa_genes)
+int_tpm_gseGO_rppa <- int_tpm_gseGO_rppa[int_tpm_gseGO_rppa > 0]
+
+### KEGG
+int_tpm_gseKEGG_rppa <- count_genes_path_CP_single(integrative_tpm_gseKEGG_sig, integrate_tpm_rppa_genes)
+int_tpm_gseKEGG_rppa <- int_tpm_gseKEGG_rppa[int_tpm_gseKEGG_rppa > 0]
+
+### Reactome
+int_tpm_gsereact_rppa <- count_genes_path_CP_single(integrative_tpm_gsereact_sig, integrate_tpm_rppa_genes)
+int_tpm_gsereact_rppa <- int_tpm_gsereact_rppa[int_tpm_gsereact_rppa > 0]
+
+```
+
+#### Plot top 20 individual analysis pathways
+```{r}
+# RPKM
+integrative_rpkm_gsea_sig %>% top_n(20, wt = NES) %>% ggplot(aes(NES, reorder(Description, NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+integrative_rpkm_gsea_sig %>% top_n(-20, wt = NES) %>% ggplot(aes(NES, reorder(Description, -NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+integrative_rpkm_gseGO_sig %>% top_n(20, wt = NES) %>% ggplot(aes(NES, reorder(Description, NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+integrative_rpkm_gseGO_sig %>% top_n(-20, wt = NES) %>% ggplot(aes(NES, reorder(Description, -NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+integrative_rpkm_gseKEGG_sig %>% top_n(20, wt = NES) %>% ggplot(aes(NES, reorder(Description, NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+## only five downregulated pathways for KEGG
+integrative_rpkm_gseKEGG_sig %>% top_n(-5, wt = NES) %>% ggplot(aes(NES, reorder(Description, -NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+integrative_rpkm_gsereact_sig %>% top_n(20, wt = NES) %>% ggplot(aes(NES, reorder(Description, NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+integrative_rpkm_gsereact_sig %>% top_n(-20, wt = NES) %>% ggplot(aes(NES, reorder(Description, -NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+```
+
+```{r}
+# TPM
+integrative_tpm_gsea_sig %>% top_n(20, wt = NES) %>% ggplot(aes(NES, reorder(Description, NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+integrative_tpm_gsea_sig %>% top_n(-20, wt = NES) %>% ggplot(aes(NES, reorder(Description, -NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+integrative_tpm_gseGO_sig %>% top_n(20, wt = NES) %>% ggplot(aes(NES, reorder(Description, NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+integrative_tpm_gseGO_sig %>% top_n(-20, wt = NES) %>% ggplot(aes(NES, reorder(Description, -NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+## only 4 pathways which are downregulated (no upregulated)
+integrative_tpm_gseKEGG_sig %>% top_n(-4, wt = NES) %>% ggplot(aes(NES, reorder(Description, -NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+integrative_tpm_gsereact_sig %>% top_n(20, wt = NES) %>% ggplot(aes(NES, reorder(Description, NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+# only 11 downregulated Reactome pathways
+integrative_tpm_gsereact_sig %>% top_n(-11, wt = NES) %>% ggplot(aes(NES, reorder(Description, -NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+```
+
+```{r}
+# RNA-only
+rnaseq_orig_gsea_sig %>% top_n(20, wt = NES) %>% ggplot(aes(NES, reorder(Description, NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+rnaseq_orig_gsea_sig %>% top_n(-20, wt = NES) %>% ggplot(aes(NES, reorder(Description, -NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+rnaseq_orig_gseGO_sig %>% top_n(20, wt = NES) %>% ggplot(aes(NES, reorder(Description, NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+rnaseq_orig_gseGO_sig %>% top_n(-20, wt = NES) %>% ggplot(aes(NES, reorder(Description, -NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+# only 14 upregulated KEGG pathways
+rnaseq_orig_gseKEGG_sig %>% top_n(14, wt = NES) %>% ggplot(aes(NES, reorder(Description, NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+## only 4 downregulated KEGG pathways
+rnaseq_orig_gseKEGG_sig %>% top_n(-4, wt = NES) %>% ggplot(aes(NES, reorder(Description, -NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+# only 17 upregulated Reactome pathways
+rnaseq_orig_gsereact_sig %>% top_n(17, wt = NES) %>% ggplot(aes(NES, reorder(Description, NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+
+rnaseq_orig_gsereact_sig %>% top_n(-20, wt = NES) %>% ggplot(aes(NES, reorder(Description, -NES), fill= Description, color = Description)) + geom_bar(stat = 'identity', position = 'dodge') + ylab('Pathways') + xlab('NES') + theme_bw() + theme(axis.text.y = element_text(size = 10), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15), legend.position = 'none')
+```
+
+#### Plot Top Integrative vs RNA-only Pathways
+```{r}
+# up
+## msigdb
+int_rna_gsea_compare <- integrative_rpkm_gsea_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+int_rna_gsea_compare <- cbind(int_rna_gsea_compare, rnaseq_orig_gsea@result %>% filter(Description %in% int_rna_gsea_compare$path) %>% arrange(match(Description, int_rna_gsea_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+int_rna_gsea_compare <- int_rna_gsea_compare %>% arrange(-int_NES)
+int_rna_gsea_compare$path <- factor(int_rna_gsea_compare$path, rev(as.character(int_rna_gsea_compare$path)))
+
+int_rna_gsea_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+int_rna_gsea_compare <- integrative_tpm_gsea_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+int_rna_gsea_compare <- cbind(int_rna_gsea_compare, rnaseq_orig_gsea@result %>% filter(Description %in% int_rna_gsea_compare$path) %>% arrange(match(Description, int_rna_gsea_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+int_rna_gsea_compare <- int_rna_gsea_compare %>% arrange(-int_NES)
+int_rna_gsea_compare$path <- factor(int_rna_gsea_compare$path, rev(as.character(int_rna_gsea_compare$path)))
+
+int_rna_gsea_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+## GO
+int_rna_gseGO_compare <- integrative_rpkm_gseGO_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+int_rna_gseGO_compare <- cbind(int_rna_gseGO_compare, rnaseq_orig_gseGO@result %>% filter(Description %in% int_rna_gseGO_compare$path) %>% arrange(match(Description, int_rna_gseGO_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+int_rna_gseGO_compare <- int_rna_gseGO_compare %>% arrange(-int_NES)
+int_rna_gseGO_compare$path <- factor(int_rna_gseGO_compare$path, rev(as.character(int_rna_gseGO_compare$path)))
+
+int_rna_gseGO_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+int_rna_gseGO_compare <- integrative_tpm_gseGO_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+int_rna_gseGO_compare <- cbind(int_rna_gseGO_compare, rnaseq_orig_gseGO@result %>% filter(Description %in% int_rna_gseGO_compare$path) %>% arrange(match(Description, int_rna_gseGO_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+int_rna_gseGO_compare <- int_rna_gseGO_compare %>% arrange(-int_NES)
+int_rna_gseGO_compare$path <- factor(int_rna_gseGO_compare$path, rev(as.character(int_rna_gseGO_compare$path)))
+
+int_rna_gseGO_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+## KEGG
+int_rna_gseKEGG_compare <- integrative_rpkm_gseKEGG_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+int_rna_gseKEGG_compare <- cbind(int_rna_gseKEGG_compare, rnaseq_orig_gseKEGG@result %>% filter(Description %in% int_rna_gseKEGG_compare$path) %>% arrange(match(Description, int_rna_gseKEGG_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+int_rna_gseKEGG_compare <- int_rna_gseKEGG_compare %>% arrange(-int_NES)
+int_rna_gseKEGG_compare$path <- factor(int_rna_gseKEGG_compare$path, rev(as.character(int_rna_gseKEGG_compare$path)))
+
+int_rna_gseKEGG_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+# no upregulated pathways for tpm
+# int_rna_gseKEGG_compare <- integrative_tpm_gseKEGG_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+# int_rna_gseKEGG_compare <- cbind(int_rna_gseKEGG_compare, rnaseq_orig_gseKEGG@result %>% filter(Description %in% int_rna_gseKEGG_compare$path) %>% arrange(match(Description, int_rna_gseKEGG_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+# int_rna_gseKEGG_compare <- int_rna_gseKEGG_compare %>% arrange(-int_NES)
+# int_rna_gseKEGG_compare$path <- factor(int_rna_gseKEGG_compare$path, rev(as.character(int_rna_gseKEGG_compare$path)))
+# 
+# int_rna_gseKEGG_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+## Reactome
+int_rna_gsereact_compare <- integrative_rpkm_gsereact_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+int_rna_gsereact_compare <- cbind(int_rna_gsereact_compare, rnaseq_orig_gsereact@result %>% filter(Description %in% int_rna_gsereact_compare$path) %>% arrange(match(Description, int_rna_gsereact_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+int_rna_gsereact_compare <- int_rna_gsereact_compare %>% arrange(-int_NES)
+int_rna_gsereact_compare$path <- factor(int_rna_gsereact_compare$path, rev(as.character(int_rna_gsereact_compare$path)))
+
+int_rna_gsereact_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+int_rna_gsereact_compare <- integrative_tpm_gsereact_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+int_rna_gsereact_compare <- cbind(int_rna_gsereact_compare, rnaseq_orig_gsereact@result %>% filter(Description %in% int_rna_gsereact_compare$path) %>% arrange(match(Description, int_rna_gsereact_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+int_rna_gsereact_compare <- int_rna_gsereact_compare %>% arrange(-int_NES)
+int_rna_gsereact_compare$path <- factor(int_rna_gsereact_compare$path, rev(as.character(int_rna_gsereact_compare$path)))
+
+int_rna_gsereact_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+# down
+## msigdb
+int_rna_gsea_compare <- integrative_rpkm_gsea_sig %>% top_n(-20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+int_rna_gsea_compare <- cbind(int_rna_gsea_compare, rnaseq_orig_gsea@result %>% filter(Description %in% int_rna_gsea_compare$path) %>% arrange(match(Description, int_rna_gsea_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+int_rna_gsea_compare <- int_rna_gsea_compare %>% arrange(-int_NES)
+int_rna_gsea_compare$path <- factor(int_rna_gsea_compare$path, as.character(int_rna_gsea_compare$path))
+
+int_rna_gsea_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+int_rna_gsea_compare <- integrative_tpm_gsea_sig %>% top_n(-20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+int_rna_gsea_compare <- cbind(int_rna_gsea_compare, rnaseq_orig_gsea@result %>% filter(Description %in% int_rna_gsea_compare$path) %>% arrange(match(Description, int_rna_gsea_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+int_rna_gsea_compare <- int_rna_gsea_compare %>% arrange(-int_NES)
+int_rna_gsea_compare$path <- factor(int_rna_gsea_compare$path, as.character(int_rna_gsea_compare$path))
+
+int_rna_gsea_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+## GO
+int_rna_gseGO_compare <- integrative_rpkm_gseGO_sig %>% top_n(-20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+int_rna_gseGO_compare <- cbind(int_rna_gseGO_compare, rnaseq_orig_gseGO@result %>% filter(Description %in% int_rna_gseGO_compare$path) %>% arrange(match(Description, int_rna_gseGO_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+int_rna_gseGO_compare <- int_rna_gseGO_compare %>% arrange(-int_NES)
+int_rna_gseGO_compare$path <- factor(int_rna_gseGO_compare$path, as.character(int_rna_gseGO_compare$path))
+
+int_rna_gseGO_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+int_rna_gseGO_compare <- integrative_tpm_gseGO_sig %>% top_n(-20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+x <- rnaseq_orig_gseGO@result %>% filter(Description %in% int_rna_gseGO_compare$path) %>% arrange(match(Description, int_rna_gseGO_compare$path)) %>% select(Description,NES) %>% rename(rna_NES = NES)
+int_rna_gseGO_compare <- int_rna_gseGO_compare %>% filter(path %in% x$Description)
+int_rna_gseGO_compare <- cbind(int_rna_gseGO_compare, x[-1])
+int_rna_gseGO_compare <- int_rna_gseGO_compare %>% arrange(-int_NES)
+int_rna_gseGO_compare$path <- factor(int_rna_gseGO_compare$path, as.character(int_rna_gseGO_compare$path))
+
+int_rna_gseGO_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+## KEGG
+int_rna_gseKEGG_compare <- integrative_rpkm_gseKEGG_sig %>% top_n(-4, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+int_rna_gseKEGG_compare <- cbind(int_rna_gseKEGG_compare, rnaseq_orig_gseKEGG@result %>% filter(Description %in% int_rna_gseKEGG_compare$path) %>% arrange(match(Description, int_rna_gseKEGG_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+int_rna_gseKEGG_compare <- int_rna_gseKEGG_compare %>% arrange(-int_NES)
+int_rna_gseKEGG_compare$path <- factor(int_rna_gseKEGG_compare$path, as.character(int_rna_gseKEGG_compare$path))
+
+int_rna_gseKEGG_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+int_rna_gseKEGG_compare <- integrative_tpm_gseKEGG_sig %>% top_n(-4, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+int_rna_gseKEGG_compare <- cbind(int_rna_gseKEGG_compare, rnaseq_orig_gseKEGG@result %>% filter(Description %in% int_rna_gseKEGG_compare$path) %>% arrange(match(Description, int_rna_gseKEGG_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+int_rna_gseKEGG_compare <- int_rna_gseKEGG_compare %>% arrange(-int_NES)
+int_rna_gseKEGG_compare$path <- factor(int_rna_gseKEGG_compare$path, as.character(int_rna_gseKEGG_compare$path))
+
+int_rna_gseKEGG_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+## Reactome
+int_rna_gsereact_compare <- integrative_rpkm_gsereact_sig %>% top_n(-20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+int_rna_gsereact_compare <- cbind(int_rna_gsereact_compare, rnaseq_orig_gsereact@result %>% filter(Description %in% int_rna_gsereact_compare$path) %>% arrange(match(Description, int_rna_gsereact_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+int_rna_gsereact_compare <- int_rna_gsereact_compare %>% arrange(-int_NES)
+int_rna_gsereact_compare$path <- factor(int_rna_gsereact_compare$path, as.character(int_rna_gsereact_compare$path))
+
+int_rna_gsereact_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+int_rna_gsereact_compare <- integrative_tpm_gsereact_sig %>% top_n(-11, wt = NES) %>% select(Description, NES) %>% rename(path = Description, int_NES = NES)
+int_rna_gsereact_compare <- cbind(int_rna_gsereact_compare, rnaseq_orig_gsereact@result %>% filter(Description %in% int_rna_gsereact_compare$path) %>% arrange(match(Description, int_rna_gsereact_compare$path)) %>% select(NES) %>% rename(rna_NES = NES))
+int_rna_gsereact_compare <- int_rna_gsereact_compare %>% arrange(-int_NES)
+int_rna_gsereact_compare$path <- factor(int_rna_gsereact_compare$path, as.character(int_rna_gsereact_compare$path))
+
+int_rna_gsereact_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+```
+
+#### Plot Top RNA-only vs. Integrative Pathways
+```{r}
+# up
+## msigdb
+rna_int_gsea_compare <- rnaseq_orig_gsea_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gsea_compare <- cbind(rna_int_gsea_compare, integrative_rpkm_gsea@result %>% filter(Description %in% rna_int_gsea_compare$path) %>% arrange(match(Description, rna_int_gsea_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gsea_compare$int_NES[is.nan(rna_int_gsea_compare$int_NES)] <- 0
+rna_int_gsea_compare <- rna_int_gsea_compare %>% arrange(-rna_NES)
+rna_int_gsea_compare$path <- factor(rna_int_gsea_compare$path, rev(as.character(rna_int_gsea_compare$path)))
+
+rna_int_gsea_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+rna_int_gsea_compare <- rnaseq_orig_gsea_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gsea_compare <- cbind(rna_int_gsea_compare, integrative_tpm_gsea@result %>% filter(Description %in% rna_int_gsea_compare$path) %>% arrange(match(Description, rna_int_gsea_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gsea_compare$int_NES[is.nan(rna_int_gsea_compare$int_NES)] <- 0
+rna_int_gsea_compare <- rna_int_gsea_compare %>% arrange(-rna_NES)
+rna_int_gsea_compare$path <- factor(rna_int_gsea_compare$path, rev(as.character(rna_int_gsea_compare$path)))
+
+rna_int_gsea_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+## GO
+rna_int_gseGO_compare <- rnaseq_orig_gseGO_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gseGO_compare <- cbind(rna_int_gseGO_compare, integrative_rpkm_gseGO@result %>% filter(Description %in% rna_int_gseGO_compare$path) %>% arrange(match(Description, rna_int_gseGO_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gseGO_compare$int_NES[is.nan(rna_int_gseGO_compare$int_NES)] <- 0
+rna_int_gseGO_compare <- rna_int_gseGO_compare %>% arrange(-rna_NES)
+rna_int_gseGO_compare$path <- factor(rna_int_gseGO_compare$path, rev(as.character(rna_int_gseGO_compare$path)))
+
+rna_int_gseGO_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+rna_int_gseGO_compare <- rnaseq_orig_gseGO_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gseGO_compare <- cbind(rna_int_gseGO_compare, integrative_tpm_gseGO@result %>% filter(Description %in% rna_int_gseGO_compare$path) %>% arrange(match(Description, rna_int_gseGO_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gseGO_compare$int_NES[is.nan(rna_int_gseGO_compare$int_NES)] <- 0
+rna_int_gseGO_compare <- rna_int_gseGO_compare %>% arrange(-rna_NES)
+rna_int_gseGO_compare$path <- factor(rna_int_gseGO_compare$path, rev(as.character(rna_int_gseGO_compare$path)))
+
+rna_int_gseGO_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+## KEGG
+### only 18 pathways
+rna_int_gseKEGG_compare <- rnaseq_orig_gseKEGG_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gseKEGG_compare <- cbind(rna_int_gseKEGG_compare, integrative_rpkm_gseKEGG@result %>% filter(Description %in% rna_int_gseKEGG_compare$path) %>% arrange(match(Description, rna_int_gseKEGG_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gseKEGG_compare$int_NES[is.nan(rna_int_gseKEGG_compare$int_NES)] <- 0
+rna_int_gseKEGG_compare <- rna_int_gseKEGG_compare %>% arrange(-rna_NES)
+rna_int_gseKEGG_compare$path <- factor(rna_int_gseKEGG_compare$path, rev(as.character(rna_int_gseKEGG_compare$path)))
+
+rna_int_gseKEGG_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+rna_int_gseKEGG_compare <- rnaseq_orig_gseKEGG_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gseKEGG_compare <- cbind(rna_int_gseKEGG_compare, integrative_tpm_gseKEGG@result %>% filter(Description %in% rna_int_gseKEGG_compare$path) %>% arrange(match(Description, rna_int_gseKEGG_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gseKEGG_compare$int_NES[is.nan(rna_int_gseKEGG_compare$int_NES)] <- 0
+rna_int_gseKEGG_compare <- rna_int_gseKEGG_compare %>% arrange(-rna_NES)
+rna_int_gseKEGG_compare$path <- factor(rna_int_gseKEGG_compare$path, rev(as.character(rna_int_gseKEGG_compare$path)))
+
+rna_int_gseKEGG_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+## Reactome
+rna_int_gsereact_compare <- rnaseq_orig_gsereact_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gsereact_compare <- cbind(rna_int_gsereact_compare, integrative_rpkm_gsereact@result %>% filter(Description %in% rna_int_gsereact_compare$path) %>% arrange(match(Description, rna_int_gsereact_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gsereact_compare$int_NES[is.nan(rna_int_gsereact_compare$int_NES)] <- 0
+rna_int_gsereact_compare <- rna_int_gsereact_compare %>% arrange(-rna_NES)
+rna_int_gsereact_compare$path <- factor(rna_int_gsereact_compare$path, rev(as.character(rna_int_gsereact_compare$path)))
+
+rna_int_gsereact_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+rna_int_gsereact_compare <- rnaseq_orig_gsereact_sig %>% top_n(20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gsereact_compare <- cbind(rna_int_gsereact_compare, integrative_tpm_gsereact@result %>% filter(Description %in% rna_int_gsereact_compare$path) %>% arrange(match(Description, rna_int_gsereact_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gsereact_compare$int_NES[is.nan(rna_int_gsereact_compare$int_NES)] <- 0
+rna_int_gsereact_compare <- rna_int_gsereact_compare %>% arrange(-rna_NES)
+rna_int_gsereact_compare$path <- factor(rna_int_gsereact_compare$path, rev(as.character(rna_int_gsereact_compare$path)))
+
+rna_int_gsereact_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+# down
+## msigdb
+rna_int_gsea_compare <- rnaseq_orig_gsea_sig %>% top_n(-20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gsea_compare <- cbind(rna_int_gsea_compare, integrative_rpkm_gsea@result %>% filter(Description %in% rna_int_gsea_compare$path) %>% arrange(match(Description, rna_int_gsea_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gsea_compare$int_NES[is.nan(rna_int_gsea_compare$int_NES)] <- 0
+rna_int_gsea_compare <- rna_int_gsea_compare %>% arrange(-rna_NES)
+rna_int_gsea_compare$path <- factor(rna_int_gsea_compare$path, as.character(rna_int_gsea_compare$path))
+
+rna_int_gsea_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+rna_int_gsea_compare <- rnaseq_orig_gsea_sig %>% top_n(-20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gsea_compare <- cbind(rna_int_gsea_compare, integrative_tpm_gsea@result %>% filter(Description %in% rna_int_gsea_compare$path) %>% arrange(match(Description, rna_int_gsea_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gsea_compare$int_NES[is.nan(rna_int_gsea_compare$int_NES)] <- 0
+rna_int_gsea_compare <- rna_int_gsea_compare %>% arrange(-rna_NES)
+rna_int_gsea_compare$path <- factor(rna_int_gsea_compare$path, as.character(rna_int_gsea_compare$path))
+
+rna_int_gsea_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+## GO
+rna_int_gseGO_compare <- rnaseq_orig_gseGO_sig %>% top_n(-20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gseGO_compare <- rna_int_gseGO_compare[-1,]
+rna_int_gseGO_compare <- cbind(rna_int_gseGO_compare, integrative_rpkm_gseGO@result %>% filter(Description %in% rna_int_gseGO_compare$path) %>% arrange(match(Description, rna_int_gseGO_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gseGO_compare$int_NES[is.nan(rna_int_gseGO_compare$int_NES)] <- 0
+rna_int_gseGO_compare <- rna_int_gseGO_compare %>% arrange(-rna_NES)
+rna_int_gseGO_compare$path <- factor(rna_int_gseGO_compare$path, as.character(rna_int_gseGO_compare$path))
+
+rna_int_gseGO_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+rna_int_gseGO_compare <- rnaseq_orig_gseGO_sig %>% top_n(-20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gseGO_compare <- rna_int_gseGO_compare[-1,]
+rna_int_gseGO_compare <- cbind(rna_int_gseGO_compare, integrative_tpm_gseGO@result %>% filter(Description %in% rna_int_gseGO_compare$path) %>% arrange(match(Description, rna_int_gseGO_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gseGO_compare$int_NES[is.nan(rna_int_gseGO_compare$int_NES)] <- 0
+rna_int_gseGO_compare <- rna_int_gseGO_compare %>% arrange(-rna_NES)
+rna_int_gseGO_compare$path <- factor(rna_int_gseGO_compare$path, as.character(rna_int_gseGO_compare$path))
+
+rna_int_gseGO_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+## KEGG
+rna_int_gseKEGG_compare <- rnaseq_orig_gseKEGG_sig %>% top_n(-20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gseKEGG_compare <- cbind(rna_int_gseKEGG_compare, integrative_rpkm_gseKEGG@result %>% filter(Description %in% rna_int_gseKEGG_compare$path) %>% arrange(match(Description, rna_int_gseKEGG_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gseKEGG_compare$int_NES[is.nan(rna_int_gseKEGG_compare$int_NES)] <- 0
+rna_int_gseKEGG_compare <- rna_int_gseKEGG_compare %>% arrange(-rna_NES)
+rna_int_gseKEGG_compare$path <- factor(rna_int_gseKEGG_compare$path, as.character(rna_int_gseKEGG_compare$path))
+
+rna_int_gseKEGG_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+rna_int_gseKEGG_compare <- rnaseq_orig_gseKEGG_sig %>% top_n(-20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gseKEGG_compare <- cbind(rna_int_gseKEGG_compare, integrative_tpm_gseKEGG@result %>% filter(Description %in% rna_int_gseKEGG_compare$path) %>% arrange(match(Description, rna_int_gseKEGG_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gseKEGG_compare$int_NES[is.nan(rna_int_gseKEGG_compare$int_NES)] <- 0
+rna_int_gseKEGG_compare <- rna_int_gseKEGG_compare %>% arrange(-rna_NES)
+rna_int_gseKEGG_compare$path <- factor(rna_int_gseKEGG_compare$path, as.character(rna_int_gseKEGG_compare$path))
+
+rna_int_gseKEGG_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+## Reactome
+rna_int_gsereact_compare <- rnaseq_orig_gsereact_sig %>% top_n(-20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gsereact_compare <- cbind(rna_int_gsereact_compare, integrative_rpkm_gsereact@result %>% filter(Description %in% rna_int_gsereact_compare$path) %>% arrange(match(Description, rna_int_gsereact_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gsereact_compare$int_NES[is.nan(rna_int_gsereact_compare$int_NES)] <- 0
+rna_int_gsereact_compare <- rna_int_gsereact_compare %>% arrange(-rna_NES)
+rna_int_gsereact_compare$path <- factor(rna_int_gsereact_compare$path, as.character(rna_int_gsereact_compare$path))
+
+rna_int_gsereact_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+rna_int_gsereact_compare <- rnaseq_orig_gsereact_sig %>% top_n(-20, wt = NES) %>% select(Description, NES) %>% rename(path = Description, rna_NES = NES)
+rna_int_gsereact_compare <- cbind(rna_int_gsereact_compare, integrative_tpm_gsereact@result %>% filter(Description %in% rna_int_gsereact_compare$path) %>% arrange(match(Description, rna_int_gsereact_compare$path)) %>% select(NES) %>% rename(int_NES = NES))
+rna_int_gsereact_compare$int_NES[is.nan(rna_int_gsereact_compare$int_NES)] <- 0
+rna_int_gsereact_compare <- rna_int_gsereact_compare %>% arrange(-rna_NES)
+rna_int_gsereact_compare$path <- factor(rna_int_gsereact_compare$path, as.character(rna_int_gsereact_compare$path))
+
+rna_int_gsereact_compare %>% reshape::melt('path') %>% ggplot(aes(value, path, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge')
+
+```
+
+# OTHER ANALYSIS
+## Pathway analysis with untransformed FC
+Genes that have greater than 2 -log2(FC) for RPPA and RNA-seq are used in DAVID/enrichment analysis. RNA-seq genes were filtered first by DE (q < .05).
+```{r}
+# all genes list
+all_rna_genes <- unique(rnaseq_names$Description)
+
+rppa_ab_genes <- read.csv('CCLE_RPPA_Ab_info_20181226.csv', header = T, stringsAsFactors = F)
+all_rppa_genes <- unique(rppa_ab_genes$Target_Genes)
+
+all_genes <- unique(c(all_rna_genes, all_rppa_genes))
+
+# calculating rppa FC 
+
+x <- unlist(rppa_data_filt)
+hist(x)
+
+rppa_pos_mean <- sapply(rppa_data_filt[rownames(rppa_data_filt) %in% pos_group,], mean)
+names(rppa_pos_mean) <- rppa_ab_genes$Target_Genes
+rppa_neg_mean <- sapply(rppa_data_filt[rownames(rppa_data_filt) %in% neg_group,], mean)
+names(rppa_neg_mean) <- rppa_ab_genes$Target_Genes
+
+# Calculate log2FC 
+## RPPA data is log2 normalized
+rppa_log2FC <- rppa_pos_mean - rppa_neg_mean
+
+# Finding upregulated and downregulated rppa genes
+up_rppa_genes <- unique(names(rppa_log2FC[rppa_log2FC > 1]))
+down_rppa_genes <- unique(names(rppa_log2FC[rppa_log2FC < -1]))
+
+# Finding upregualted and downregulated rna genes
+up_rna_genes <- unique(res_data_filt$gene_name[res_data_filt$log2FoldChange > 2])
+down_rna_genes <- unique(res_data_filt$gene_name[res_data_filt$log2FoldChange < -2])
+
+# Combining lists 
+up_genes <- unique(c(up_rppa_genes, up_rna_genes))
+down_genes <- unique(c(down_rppa_genes, down_rna_genes))
+
+# Changing alias gene names to ENTREZ 
+up_genes_entrez <- mapIds(x = org.Hs.eg.db, keys = up_genes, column = 'ENTREZID', 
+                           keytype = c('ALIAS'))
+up_rppa_entrez <- up_genes_entrez[names(up_genes_entrez) %in% up_rppa_genes]
+up_genes_entrez <- up_genes_entrez[!is.na(up_genes_entrez)]
+
+
+down_genes_entrez <- mapIds(x = org.Hs.eg.db, keys = down_genes, column = 'ENTREZID', 
+                           keytype = c('ALIAS'))
+down_rppa_entrez <- down_genes_entrez[names(down_genes_entrez) %in% down_rppa_genes]
+down_genes_entrez <- down_genes_entrez[!is.na(down_genes_entrez)]
+
+
+all_genes_entrez <- mapIds(x = org.Hs.eg.db, keys = all_genes, column = 'ENTREZID', 
+                           keytype = c('ALIAS'))
+all_genes_entrez <- all_genes_entrez[!is.na(all_genes_entrez)]
+
+
+write.table(as.numeric(all_genes_entrez), file = 'CCLE_integrative/david_untransformed_analysis/background_genes.txt', sep = '\n', row.names = F, col.names = F)
+write.table(as.numeric(up_genes_entrez), file = 'CCLE_integrative/david_untransformed_analysis/up_genes.txt', sep = '\n', row.names = F, col.names = F)
+write.table(as.numeric(down_genes_entrez), file = 'CCLE_integrative/david_untransformed_analysis/down_genes.txt', sep = '\n', row.names = F, col.names = F)
+
+```
+
+### clusterProfiler enrichment
+```{r}
+## GO analysis
+up_GO <- enrichGO(up_genes_entrez, universe = all_genes_entrez, OrgDb = org.Hs.eg.db, ont = 'ALL')
+down_GO <- enrichGO(down_genes_entrez, universe = all_genes_entrez, OrgDb = org.Hs.eg.db, ont = 'ALL')
+
+## KEGG
+up_KEGG <- enrichKEGG(up_genes_entrez, universe = all_genes_entrez, organism = 'hsa')
+down_KEGG <- enrichKEGG(down_genes_entrez, universe = all_genes_entrez, organism = 'hsa')
+
+## Reactome
+up_reactome <- enrichPathway(up_genes_entrez, universe = all_genes_entrez, organism = 'human')
+down_reactome <- enrichPathway(down_genes_entrez, universe = all_genes_entrez, organism = 'human')
+
+## MSigDB
+up_msigdb <- enricher(up_genes_entrez, universe = all_genes_entrez, TERM2GENE = msigdb_c2)
+down_msigdb <- enricher(down_genes_entrez, universe = all_genes_entrez, TERM2GENE = msigdb_c2)
+
+```
+
+### Compare between DAVID and clusterProfiler
+```{r}
+## GO
+up_DAVID_GO <- read.table('CCLE_integrative/david_untransformed_analysis/david_up_genes_GO_051220.txt', sep = '\t', header = T, stringsAsFactors = F)
+up_DAVID_GO$term_filt <- sapply(up_DAVID_GO$Term, function(x) strsplit(x, split = '\\~')[[1]][1])
+up_DAVID_GO <- up_DAVID_GO[up_DAVID_GO$Benjamini < .05,]
+
+down_DAVID_GO <- read.table('CCLE_integrative/david_untransformed_analysis/david_down_genes_GO_051220.txt', sep = '\t', header = T, stringsAsFactors = F)
+down_DAVID_GO$term_filt <- sapply(down_DAVID_GO$Term, function(x) strsplit(x, split = '\\~')[[1]][1])
+down_DAVID_GO <- down_DAVID_GO[down_DAVID_GO$Benjamini < .05,]
+
+x <- up_DAVID_GO$term_filt %in% up_GO@result$ID
+y <- up_GO@result$ID %in% up_DAVID_GO$term_filt
+
+x_data <- up_DAVID_GO[x,]
+y_data <- up_GO@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+up_GO_compare <- cbind(y_data[,c(1:3,10,6:7)], x_data[,c(3,5,12)])
+colnames(up_GO_compare) <- c('Ontology', 'Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+up_GO_compare <- up_GO_compare %>% arrange(-DAVID_count)
+
+x <- down_DAVID_GO$term_filt %in% down_GO@result$ID
+y <- down_GO@result$ID %in% down_DAVID_GO$term_filt
+
+x_data <- down_DAVID_GO[x,]
+y_data <- down_GO@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+down_GO_compare <- cbind(y_data[,c(1:3,10,6:7)], x_data[,c(3,5,12)])
+colnames(down_GO_compare) <- c('Ontology', 'Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+down_GO_compare <- down_GO_compare %>% arrange(-DAVID_count)
+
+## KEGG
+up_DAVID_KEGG <- read.table('CCLE_integrative/david_untransformed_analysis/david_up_genes_kegg_reactome_050620.txt', sep = '\t', header = T, stringsAsFactors = F)
+up_DAVID_KEGG <- up_DAVID_KEGG %>% filter(Category == 'KEGG_PATHWAY')
+up_DAVID_KEGG$term_filt <- sapply(up_DAVID_KEGG$Term, function(x) strsplit(x, split = ':')[[1]][1])
+up_DAVID_KEGG <- up_DAVID_KEGG[up_DAVID_KEGG$Benjamini < .05,]
+
+down_DAVID_KEGG <- read.table('CCLE_integrative/david_untransformed_analysis/david_down_genes_kegg_reactome_050620.txt', sep = '\t', header = T, stringsAsFactors = F)
+down_DAVID_KEGG <- down_DAVID_KEGG %>% filter(Category == 'KEGG_PATHWAY')
+down_DAVID_KEGG$term_filt <- sapply(down_DAVID_KEGG$Term, function(x) strsplit(x, split = ':')[[1]][1])
+down_DAVID_KEGG <- down_DAVID_KEGG[down_DAVID_KEGG$Benjamini < .05,]
+
+x <- up_DAVID_KEGG$term_filt %in% up_KEGG@result$ID
+y <- up_KEGG@result$ID %in% up_DAVID_KEGG$term_filt
+
+x_data <- up_DAVID_KEGG[x,]
+y_data <- up_KEGG@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+up_KEGG_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(up_KEGG_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+up_KEGG_compare <- up_KEGG_compare %>% arrange(-DAVID_count)
+
+x <- down_DAVID_KEGG$term_filt %in% down_KEGG@result$ID
+y <- down_KEGG@result$ID %in% down_DAVID_KEGG$term_filt
+
+x_data <- down_DAVID_KEGG[x,]
+y_data <- down_KEGG@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+down_KEGG_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(down_KEGG_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+down_KEGG_compare <- down_KEGG_compare %>% arrange(-DAVID_count)
+
+## Reactome
+up_DAVID_reactome <- read.table('CCLE_integrative/david_untransformed_analysis/david_up_genes_kegg_reactome_050620.txt', sep = '\t', header = T, stringsAsFactors = F)
+up_DAVID_reactome <- up_DAVID_reactome %>% filter(Category == 'REACTOME_PATHWAY')
+up_DAVID_reactome$term_filt <- sapply(up_DAVID_reactome$Term, function(x) strsplit(x, split = ':')[[1]][1])
+up_DAVID_reactome <- up_DAVID_reactome[up_DAVID_reactome$Benjamini < .05,]
+
+down_DAVID_reactome <- read.table('CCLE_integrative/david_untransformed_analysis/david_down_genes_kegg_reactome_050620.txt', sep = '\t', header = T, stringsAsFactors = F)
+down_DAVID_reactome <- down_DAVID_reactome %>% filter(Category == 'REACTOME_PATHWAY')
+down_DAVID_reactome$term_filt <- sapply(down_DAVID_reactome$Term, function(x) strsplit(x, split = ':')[[1]][1])
+down_DAVID_reactome <- down_DAVID_reactome[down_DAVID_reactome$PValue < .05,] # no pathways are significant based on adjusted
+
+x <- up_DAVID_reactome$term_filt %in% up_reactome@result$ID
+y <- up_reactome@result$ID %in% up_DAVID_reactome$term_filt
+
+x_data <- up_DAVID_reactome[x,]
+y_data <- up_reactome@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+up_reactome_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(up_reactome_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+up_reactome_compare <- up_reactome_compare %>% arrange(-DAVID_count)
+
+x <- down_DAVID_reactome$term_filt %in% down_reactome@result$ID
+y <- down_reactome@result$ID %in% down_DAVID_reactome$term_filt
+
+x_data <- down_DAVID_reactome[x,]
+y_data <- down_reactome@result[y,]
+y_data <- y_data[match(x_data$term_filt, y_data$ID),]
+
+down_reactome_compare <- cbind(y_data[,c(1:2,9,5:6)], x_data[,c(3,5,12)])
+colnames(down_reactome_compare) <- c('Term', 'Description', 'CP_count', 'CP_p', 'CP_p_BH', 'DAVID_count', 'DAVID_p', 'DAVID_p_BH')
+down_reactome_compare <- down_reactome_compare %>% arrange(-DAVID_count)
+
+```
+
+### Count how many rppa and rna genes are in pathways
+```{r}
+## functions
+count_genes_path_DAVID <- function(full_table, compare_table, rppa_genes) {
+  filt_table <- full_table %>% filter(term_filt %in% compare_table$Term)
+  
+  rppa_count <- c()
+  
+  for (current in filt_table$Genes) {
+    genes_list <- strsplit(current, ', ')[[1]]
+    count <- sum(rppa_genes %in% genes_list)
+    rppa_count <- c(rppa_count, count)
+  }
+  
+  compare_table <- cbind(compare_table, data.frame(rppa_count_DAVID = rppa_count))
+  
+  return(compare_table)
+}
+
+count_genes_path_CP <- function(full_table, compare_table, rppa_genes) {
+  filt_table <- full_table %>% filter(full_table$ID %in% compare_table$Term)
+  
+  rppa_count <- c()
+  
+  for (current in filt_table$geneID) {
+    genes_list <- strsplit(current, '/')[[1]]
+    count <- sum(rppa_genes %in% genes_list)
+    rppa_count <- c(rppa_count, count)
+  }
+  
+  compare_table <- cbind(compare_table, data.frame(rppa_count_CP = rppa_count))
+  
+  return(compare_table)
+}
+
+## up DAVID
+up_GO_compare <- count_genes_path_DAVID(up_DAVID_GO, up_GO_compare, up_rppa_entrez)
+up_GO_compare$rna_count_DAVID <- up_GO_compare$DAVID_count - up_GO_compare$rppa_count_DAVID
+
+up_KEGG_compare <- count_genes_path_DAVID(up_DAVID_KEGG, up_KEGG_compare, up_rppa_entrez)
+up_KEGG_compare$rna_count_DAVID <- up_KEGG_compare$DAVID_count - up_KEGG_compare$rppa_count_DAVID
+
+up_reactome_compare <- count_genes_path_DAVID(up_DAVID_reactome, up_reactome_compare, up_rppa_entrez)
+up_reactome_compare$rna_count_DAVID <- up_reactome_compare$DAVID_count - up_reactome_compare$rppa_count_DAVID
+
+## down DAVID
+down_GO_compare <- count_genes_path_DAVID(down_DAVID_GO, down_GO_compare, down_rppa_entrez)
+down_GO_compare$rna_count_DAVID <- down_GO_compare$DAVID_count - down_GO_compare$rppa_count_DAVID
+
+down_KEGG_compare <- count_genes_path_DAVID(down_DAVID_KEGG, down_KEGG_compare, down_rppa_entrez)
+down_KEGG_compare$rna_count_DAVID <- down_KEGG_compare$DAVID_count - down_KEGG_compare$rppa_count_DAVID
+
+down_reactome_compare <- count_genes_path_DAVID(down_DAVID_reactome, down_reactome_compare, down_rppa_entrez)
+down_reactome_compare$rna_count_DAVID <- down_reactome_compare$DAVID_count - down_reactome_compare$rppa_count_DAVID
+
+## up CP
+up_GO_compare <- count_genes_path_CP(up_GO@result, up_GO_compare, up_rppa_entrez)
+up_GO_compare$rna_count_CP <- up_GO_compare$CP_count - up_GO_compare$rppa_count_CP
+
+up_KEGG_compare <- count_genes_path_CP(up_KEGG@result, up_KEGG_compare, up_rppa_entrez)
+up_KEGG_compare$rna_count_CP <- up_KEGG_compare$CP_count - up_KEGG_compare$rppa_count_CP
+
+up_reactome_compare <- count_genes_path_CP(up_reactome@result, up_reactome_compare, up_rppa_entrez)
+up_reactome_compare$rna_count_CP <- up_reactome_compare$CP_count - up_reactome_compare$rppa_count_CP
+
+## down CP
+down_GO_compare <- count_genes_path_CP(down_GO@result, down_GO_compare, down_rppa_entrez)
+down_GO_compare$rna_count_CP <- down_GO_compare$CP_count - down_GO_compare$rppa_count_CP
+
+down_KEGG_compare <- count_genes_path_CP(down_KEGG@result, down_KEGG_compare, down_rppa_entrez)
+down_KEGG_compare$rna_count_CP <- down_KEGG_compare$CP_count - down_KEGG_compare$rppa_count_CP
+
+down_reactome_compare <- count_genes_path_CP(down_reactome@result, down_reactome_compare, down_rppa_entrez)
+down_reactome_compare$rna_count_CP <- down_reactome_compare$CP_count - down_reactome_compare$rppa_count_CP
+
+# export compared files
+write.csv(up_GO_compare, file = 'CCLE_integrative/david_untransformed_analysis/up_GO_compare_051420.csv')
+write.csv(down_GO_compare, file = 'CCLE_integrative/david_untransformed_analysis/down_GO_compare_051420.csv')
+write.csv(up_KEGG_compare, file = 'CCLE_integrative/david_untransformed_analysis/up_KEGG_compare_051420.csv')
+write.csv(down_KEGG_compare, file = 'CCLE_integrative/david_untransformed_analysis/down_KEGG_compare_051420.csv')
+write.csv(up_reactome_compare, file = 'CCLE_integrative/david_untransformed_analysis/up_reactome_compare_051420.csv')
+write.csv(down_reactome_compare, file = 'CCLE_integrative/david_untransformed_analysis/down_reactome_compare_051420.csv')
+```
+
+### Compare between untransformed integrative and RNA-only
+
+
+
+### Plots
+```{r}
+## top 20 compared pathways
+up_GO_compare %>% top_n(20, wt = DAVID_count) %>% dplyr::select(Description, CP_count, DAVID_count) %>% melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+down_GO_compare %>% top_n(20, wt = DAVID_count) %>% dplyr::select(Description, CP_count, DAVID_count) %>% melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+up_KEGG_compare %>% top_n(20, wt = DAVID_count) %>% dplyr::select(Description, CP_count, DAVID_count) %>% melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+down_KEGG_compare %>% top_n(20, wt = DAVID_count) %>% dplyr::select(Description, CP_count, DAVID_count) %>% melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+up_reactome_compare %>% top_n(20, wt = DAVID_count) %>% dplyr::select(Description, CP_count, DAVID_count) %>% melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+down_reactome_compare %>% top_n(20, wt = DAVID_count) %>% dplyr::select(Description, CP_count, DAVID_count) %>% melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity', position = 'dodge') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+## rppa gene content plots (maybe change so it's percentage)
+up_GO_compare %>% top_n(10, wt = rppa_count_CP) %>% dplyr::select(Description, rppa_count_CP, rna_count_CP) %>% melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+down_GO_compare %>% top_n(10, wt = rppa_count_CP) %>% dplyr::select(Description, rppa_count_CP, rna_count_CP) %>% melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+up_KEGG_compare %>% top_n(10, wt = rppa_count_CP) %>% dplyr::select(Description, rppa_count_CP, rna_count_CP) %>% melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+
+down_KEGG_compare %>% top_n(10, wt = rppa_count_CP) %>% dplyr::select(Description, rppa_count_CP, rna_count_CP) %>% melt(id.vars = 'Description') %>% ggplot(aes(reorder(Description, value), value, fill = variable)) + geom_bar(stat = 'identity') + coord_flip() + ylab('Gene Count') + xlab('Pathways') + theme_bw() + theme(axis.text.y = element_text(size = 12), axis.title.x = element_text(size = 15), axis.title.y = element_text(size = 15))
+```
+
