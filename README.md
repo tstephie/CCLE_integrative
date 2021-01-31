@@ -9,6 +9,8 @@ Data using:
   3) normalized RPPA*
 * Used these datasets for analysis
 
+Data was obtained from CCLE: https://portals.broadinstitute.org/ccle
+
 Names of datasets used (based on v3.1 script):
 1) CCLE_RNAseq_genes_counts_20180929.gct
   - Raw RNA-seq counts
